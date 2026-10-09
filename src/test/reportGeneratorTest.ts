@@ -158,14 +158,28 @@ console.log(`Generated PDF page count: ${pagesMissing}`);
 console.assert(pagesMissing >= 2, `Expected at least 2 pages, got ${pagesMissing}`);
 console.log('TEST 4 PASSED.\n');
 
-// TEST 5: PDF ArrayBuffer integrity test
-console.log('--- TEST 5: PDF BINARY INTEGRITY CHECK ---');
+// TEST 5: PDF ArrayBuffer integrity and text encoding tests
+console.log('--- TEST 5: PDF BINARY & ENCODING INTEGRITY CHECK ---');
 const arrayBuffer = docCritical.output('arraybuffer');
 console.log(`PDF binary generated, byte length: ${arrayBuffer.byteLength} bytes`);
 console.assert(arrayBuffer.byteLength > 5000, 'PDF size should be substantial with vector graphics and tables');
 const pdfHeader = Buffer.from(arrayBuffer.slice(0, 5)).toString('ascii');
 console.log(`PDF Magic Header: ${pdfHeader}`);
 console.assert(pdfHeader === '%PDF-', 'Valid PDF file header required');
+
+// Check raw text stream in generated PDF string
+const pdfRawString = docCritical.output();
+console.assert(!pdfRawString.includes('+Infinity'), 'Must not contain +Infinity');
+console.assert(!pdfRawString.includes('NaN'), 'Must not contain NaN');
+console.assert(!pdfRawString.includes('undefined'), 'Must not contain undefined');
+console.assert(!pdfRawString.includes('\u2794'), 'Must not contain unencoded unicode arrow \u2794');
+console.assert(pdfRawString.includes('SECTION 08'), 'SECTION 08 must exist');
+console.assert(pdfRawString.includes('SECTION 09'), 'SECTION 09 must exist');
+
+const s8Pos = pdfRawString.indexOf('SECTION 08');
+const s9Pos = pdfRawString.indexOf('SECTION 09');
+console.assert(s9Pos > s8Pos, 'SECTION 09 must be generated after SECTION 08');
+console.log('Text encoding, non-finite value checks, and section order: ALL PASSED');
 console.log('TEST 5 PASSED.\n');
 
 // TEST 6: Severed Road Network (All roads closed) -> Honest No-Feasible-Route Handling
@@ -195,8 +209,19 @@ const docSevered = generateLocationDossierPdf({
 const pagesSevered = docSevered.getNumberOfPages();
 console.log(`Generated PDF page count under severed road network: ${pagesSevered}`);
 console.assert(pagesSevered >= 3, `Expected at least 3 pages, got ${pagesSevered}`);
-const severedBuffer = docSevered.output('arraybuffer');
-console.log(`Severed route PDF generated successfully, byte length: ${severedBuffer.byteLength} bytes`);
+const severedString = docSevered.output();
+console.assert(severedString.includes('NO FEASIBLE EVACUATION ROUTE'), 'Must explicitly state no feasible route when severed');
+console.assert(!severedString.includes('+Infinity min'), 'Must not contain +Infinity min in road delays');
+console.assert(!severedString.includes('NaN'), 'Must not contain NaN');
+console.log('Severed route PDF generated successfully with honest status');
 console.log('TEST 6 PASSED.\n');
 
-console.log('=== ALL 6 PDF REPORT GENERATOR TESTS PASSED SUCCESSFULLY! ===');
+// TEST 7: Missing Historical Records String Exactness
+console.log('--- TEST 7: MISSING HISTORICAL RECORDS STRING EXACTNESS ---');
+const missingString = docMissing.output();
+const expectedMissingNotice = 'No verified historical flood response records are available for this location in the current data sources.';
+console.assert(missingString.includes(expectedMissingNotice), 'Must contain the exact mandated notice for locations without records');
+console.log(`Verified presence of exact required fallback notice: "${expectedMissingNotice}"`);
+console.log('TEST 7 PASSED.\n');
+
+console.log('=== ALL 7 PDF REPORT GENERATOR TESTS PASSED SUCCESSFULLY! ===');
