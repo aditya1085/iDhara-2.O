@@ -1840,6 +1840,10 @@ export const ModuleWorkspace: React.FC<ModuleWorkspaceProps> = ({
           alerts={alerts}
           dataHealthReport={dataHealthReport}
           activeRole={activeRole}
+          params={params}
+          shelters={shelters}
+          evacuationPlans={evacuationPlans}
+          routes={routes}
         />
       </div>
     );

@@ -1,5 +1,4 @@
-import React, { useState, useMemo } from 'react';
-import { jsPDF } from 'jspdf';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   FloodRiskCell,
   RoadSegmentState,
@@ -9,7 +8,20 @@ import {
   FloodSeverity,
   WarningLevel,
   UserRole,
+  ScenarioParameters,
+  Shelter,
+  EvacuationPlanItem,
+  RouteRecommendation,
+  DisasterStage,
 } from '../types/idhara';
+import {
+  generateLocationDossierPdf,
+  ReportingPeriod,
+  REPORTING_PERIOD_LABELS,
+  RISK_COLORS,
+} from '../modules/pdfReportGenerator';
+import { getVerifiedHistoricalRecordsForCell } from '../data/indoreHistoricalRecords';
+import { findNearestNodeForCell, computeSingleRoute } from '../modules/routing';
 
 interface LocationReportModalProps {
   isOpen: boolean;
@@ -20,9 +32,12 @@ interface LocationReportModalProps {
   alerts: AlertItem[];
   dataHealthReport: DataHealthReport;
   activeRole?: UserRole;
+  params?: ScenarioParameters;
+  shelters?: Shelter[];
+  evacuationPlans?: EvacuationPlanItem[];
+  routes?: RouteRecommendation[];
+  initialSelectedCellId?: string;
 }
-
-export type ReportingPeriod = 'CURRENT_6H' | 'PAST_24H' | 'NEXT_12H_FORECAST' | 'FULL_INCIDENT';
 
 export const LocationReportModal: React.FC<LocationReportModalProps> = ({
   isOpen,
@@ -32,19 +47,42 @@ export const LocationReportModal: React.FC<LocationReportModalProps> = ({
   sensors,
   alerts,
   dataHealthReport,
+  params,
+  shelters = [],
+  evacuationPlans = [],
+  routes = [],
+  initialSelectedCellId,
 }) => {
-  // 1. Selection states
-  const [selectedCellId, setSelectedCellId] = useState<string>(cells[0]?.id || 'C-2-2');
+  // 1. Selection & search states
+  const [selectedCellId, setSelectedCellId] = useState<string>(
+    initialSelectedCellId || cells[0]?.id || 'CELL-R2C2'
+  );
   const [searchFilter, setSearchFilter] = useState<string>('');
   const [reportingPeriod, setReportingPeriod] = useState<ReportingPeriod>('CURRENT_6H');
+
+  // 2. Sections to include
+  const [includeSpatialGridVisual, setIncludeSpatialGridVisual] = useState<boolean>(true);
   const [includeSensorAudit, setIncludeSensorAudit] = useState<boolean>(true);
   const [includeRoadDisruptions, setIncludeRoadDisruptions] = useState<boolean>(true);
   const [includeAlertsSummary, setIncludeAlertsSummary] = useState<boolean>(true);
+  const [includeEvacuationRoute, setIncludeEvacuationRoute] = useState<boolean>(true);
+  const [includeHistoricalEvents, setIncludeHistoricalEvents] = useState<boolean>(true);
+  const [includePrecautionsPlan, setIncludePrecautionsPlan] = useState<boolean>(true);
 
-  // 2. Report Generation states
+  // 3. Execution states
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [generatedReportReady, setGeneratedReportReady] = useState<boolean>(false);
   const [downloadSuccess, setDownloadSuccess] = useState<boolean>(false);
+  const [activePreviewTab, setActivePreviewTab] = useState<
+    'summary' | 'evacuation' | 'historical' | 'precautions' | 'telemetry'
+  >('summary');
+
+  // Sync initialSelectedCellId when modal opens
+  useEffect(() => {
+    if (initialSelectedCellId && cells.some((c) => c.id === initialSelectedCellId)) {
+      setSelectedCellId(initialSelectedCellId);
+    }
+  }, [initialSelectedCellId, cells]);
 
   // Selected cell & surrounding context
   const targetCell = useMemo(() => {
@@ -54,12 +92,13 @@ export const LocationReportModal: React.FC<LocationReportModalProps> = ({
   // Filtered dropdown options
   const filteredCells = useMemo(() => {
     if (!searchFilter.trim()) return cells;
-    const q = searchFilter.toLowerCase();
+    const q = searchFilter.toLowerCase().trim();
     return cells.filter(
       (c) =>
         c.id.toLowerCase().includes(q) ||
         c.localityName.toLowerCase().includes(q) ||
-        c.wardCode.toLowerCase().includes(q)
+        c.wardCode.toLowerCase().includes(q) ||
+        c.severity.toLowerCase().includes(q)
     );
   }, [cells, searchFilter]);
 
@@ -79,7 +118,7 @@ export const LocationReportModal: React.FC<LocationReportModalProps> = ({
     return sensors.filter(
       (s) =>
         s.cellId === targetCell.id ||
-        Math.abs(s.lat - targetCell.lat) < 0.02 && Math.abs(s.lng - targetCell.lng) < 0.02
+        (Math.abs(s.lat - targetCell.lat) < 0.02 && Math.abs(s.lng - targetCell.lng) < 0.02)
     );
   }, [sensors, targetCell]);
 
@@ -97,13 +136,48 @@ export const LocationReportModal: React.FC<LocationReportModalProps> = ({
     );
   }, [alerts, targetCell]);
 
-  // Period label helper
-  const periodLabelMap: Record<ReportingPeriod, string> = {
-    CURRENT_6H: 'Current Active Window (Past 6 Hours)',
-    PAST_24H: 'Historical 24-Hour Cumulative Runoff',
-    NEXT_12H_FORECAST: 'Predictive 12-Hour Inundation Outlook',
-    FULL_INCIDENT: 'Comprehensive Incident Lifecycle Log',
-  };
+  // Verified historical records
+  const verifiedHistRecords = useMemo(() => {
+    if (!targetCell) return [];
+    return getVerifiedHistoricalRecordsForCell(targetCell.id);
+  }, [targetCell]);
+
+  // Evacuation route calculation for live preview
+  const previewEvacRoute = useMemo(() => {
+    if (!targetCell) return null;
+    const originNode = findNearestNodeForCell(targetCell);
+    const assignedShelter =
+      shelters.find((s) => s.id === targetCell.nearestShelterId) ||
+      shelters[0];
+    const shelterNodeId =
+      assignedShelter && 'nearestNodeId' in assignedShelter && (assignedShelter as any).nearestNodeId
+        ? (assignedShelter as any).nearestNodeId
+        : targetCell.nearestShelterId === 'SH-01'
+        ? 'NODE-CHIMANBAGH'
+        : targetCell.nearestShelterId === 'SH-02'
+        ? 'NODE-PALASIA'
+        : targetCell.nearestShelterId === 'SH-03'
+        ? 'NODE-COLLECTORATE'
+        : 'NODE-NAVALAKHA';
+
+    return computeSingleRoute(
+      originNode.id,
+      shelterNodeId,
+      roads,
+      params || {
+        mode: targetCell.mode,
+        stage: DisasterStage.REAL_TIME_ONGOING,
+        rainfallIntensityMmHr: targetCell.rainfallMmHr,
+        durationHours: 3,
+        drainageBlockagePct: 40,
+        upstreamKahnInflowMultiplier: 1.25,
+        sensorDropoutCount: 0,
+        timelineHourOffset: 0,
+        activeEventPresetId: 'EVT-SIM-MONSOON-SURGE',
+      },
+      'AMBULANCE'
+    );
+  }, [targetCell, shelters, roads, params]);
 
   const handleGeneratePreview = () => {
     setIsGenerating(true);
@@ -111,393 +185,144 @@ export const LocationReportModal: React.FC<LocationReportModalProps> = ({
     setTimeout(() => {
       setIsGenerating(false);
       setGeneratedReportReady(true);
-    }, 450);
+    }, 350);
   };
 
   const handleDownloadPDF = () => {
     if (!targetCell) return;
     try {
-      const doc = new jsPDF({
-        orientation: 'portrait',
-        unit: 'mm',
-        format: 'a4',
+      const doc = generateLocationDossierPdf({
+        cell: targetCell,
+        cells,
+        roads,
+        sensors,
+        alerts,
+        dataHealthReport,
+        params,
+        shelters,
+        evacuationPlans,
+        routes,
+        reportingPeriod,
+        includeSensorAudit,
+        includeRoadDisruptions,
+        includeAlertsSummary,
+        includeEvacuationRoute,
+        includeHistoricalEvents,
+        includePrecautionsPlan,
+        includeSpatialGridVisual,
       });
 
-      const pageWidth = doc.internal.pageSize.getWidth();
-      const margin = 14;
-      let y = 16;
+      const dateStr = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+      const safeLocName = targetCell.localityName.replace(/[^a-zA-Z0-9]/g, '_');
+      const fileName = `iDhara_Flood_Intelligence_Dossier_${safeLocName}_${targetCell.id}_${dateStr}.pdf`;
 
-      // Dark Mission Header Bar
-      doc.setFillColor(8, 14, 26);
-      doc.rect(0, 0, pageWidth, 28, 'F');
-
-      // Header branding
-      doc.setFont('helvetica', 'bold');
-      doc.setFontSize(15);
-      doc.setTextColor(34, 211, 238); // Cyan
-      doc.text('iDhara — URBAN FLOOD EARLY WARNING & INTELLIGENCE SYSTEM', margin, y);
-
-      y += 6;
-      doc.setFont('helvetica', 'normal');
-      doc.setFontSize(9);
-      doc.setTextColor(203, 213, 225); // Slate 300
-      doc.text(
-        `OFFICIAL HYDROMETRIC & HAZARD REPORT | ISO 8601 DATA RUN: ${new Date().toISOString()}`,
-        margin,
-        y
-      );
-
-      y = 35;
-
-      // Executive Summary Box
-      doc.setFillColor(248, 250, 252); // Light background
-      doc.setDrawColor(203, 213, 225);
-      doc.rect(margin, y, pageWidth - margin * 2, 38, 'FD');
-
-      doc.setFont('helvetica', 'bold');
-      doc.setFontSize(12);
-      doc.setTextColor(15, 23, 42); // Slate 900
-      doc.text(`Location: ${targetCell.localityName} (${targetCell.wardCode} · ${targetCell.id})`, margin + 4, y + 7);
-
-      doc.setFont('helvetica', 'normal');
-      doc.setFontSize(9);
-      doc.setTextColor(71, 85, 105);
-      doc.text(`Reporting Window: ${periodLabelMap[reportingPeriod]}`, margin + 4, y + 13);
-      doc.text(
-        `Geographical Coordinates: ${targetCell.lat.toFixed(4)}° N, ${targetCell.lng.toFixed(4)}° E | Elevation: ${targetCell.elevationM}m MSL`,
-        margin + 4,
-        y + 19
-      );
-      doc.text(
-        `Drainage Proxy: ${(targetCell.drainageProxyScore * 100).toFixed(0)}% Capacity | Impervious Surface: ${(targetCell.imperviousness * 100).toFixed(0)}%`,
-        margin + 4,
-        y + 25
-      );
-      doc.text(
-        `Population At Risk (Est.): ~${targetCell.populationEstimate.toLocaleString()} residents | Historical 10-Yr Inundations: ${targetCell.historicalFloodCount10Yr} events`,
-        margin + 4,
-        y + 31
-      );
-
-      y += 45;
-
-      // Key Metrics Row
-      doc.setFont('helvetica', 'bold');
-      doc.setFontSize(11);
-      doc.setTextColor(15, 23, 42);
-      doc.text('KEY HAZARD & TELEMETRY INDICATORS', margin, y);
-      y += 5;
-
-      const colW = (pageWidth - margin * 2 - 9) / 4;
-      const kpis = [
-        {
-          label: 'Flood Probability',
-          val: `${Math.round(targetCell.floodProbability * 100)}%`,
-          sub: `Severity: ${targetCell.severity}`,
-          color: targetCell.floodProbability >= 0.7 ? [220, 38, 38] : [217, 119, 6],
-        },
-        {
-          label: 'Rainfall (1h / Cum)',
-          val: `${targetCell.rainfallMmHr} mm/h`,
-          sub: `Cum: ${targetCell.cumulativeRainfallMm} mm`,
-          color: [2, 132, 199],
-        },
-        {
-          label: 'Warning Hysteresis',
-          val: targetCell.warningLevel,
-          sub: `State: ${targetCell.warningHysteresis?.actionDirective || 'MONITOR'}`,
-          color: targetCell.warningLevel === WarningLevel.RED ? [220, 38, 38] : [202, 138, 4],
-        },
-        {
-          label: 'Sensor Health / Data',
-          val: `${dataHealthReport.overallHealthPct}% Quality`,
-          sub: `Confidence: ${Math.round(targetCell.confidence * 100)}%`,
-          color: dataHealthReport.overallHealthPct >= 80 ? [22, 163, 74] : [217, 119, 6],
-        },
-      ];
-
-      kpis.forEach((kpi, idx) => {
-        const xPos = margin + idx * (colW + 3);
-        doc.setFillColor(241, 245, 249);
-        doc.rect(xPos, y, colW, 20, 'F');
-        doc.setDrawColor(226, 232, 240);
-        doc.rect(xPos, y, colW, 20, 'D');
-
-        doc.setFont('helvetica', 'normal');
-        doc.setFontSize(7.5);
-        doc.setTextColor(100, 116, 139);
-        doc.text(kpi.label, xPos + 3, y + 5);
-
-        doc.setFont('helvetica', 'bold');
-        doc.setFontSize(11);
-        doc.setTextColor(kpi.color[0], kpi.color[1], kpi.color[2]);
-        doc.text(kpi.val, xPos + 3, y + 12);
-
-        doc.setFont('helvetica', 'normal');
-        doc.setFontSize(7);
-        doc.setTextColor(71, 85, 105);
-        doc.text(kpi.sub.substring(0, 22), xPos + 3, y + 17);
-      });
-
-      y += 27;
-
-      // Primary Hydrological Drivers
-      doc.setFont('helvetica', 'bold');
-      doc.setFontSize(10.5);
-      doc.setTextColor(15, 23, 42);
-      doc.text('PRIMARY FLOOD INUNDATION DRIVERS', margin, y);
-      y += 5;
-
-      targetCell.topDrivers.slice(0, 3).forEach((d) => {
-        doc.setFillColor(248, 250, 252);
-        doc.rect(margin, y, pageWidth - margin * 2, 9, 'F');
-        doc.setFont('helvetica', 'bold');
-        doc.setFontSize(8.5);
-        doc.setTextColor(30, 41, 59);
-        doc.text(`• ${d.factor} (${d.weight}% influence):`, margin + 3, y + 5.5);
-
-        doc.setFont('helvetica', 'normal');
-        doc.setFontSize(8);
-        doc.setTextColor(71, 85, 105);
-        doc.text(d.description.substring(0, 85), margin + 48, y + 5.5);
-        y += 10;
-      });
-
-      y += 3;
-
-      // Section: Local Telemetry & Sensor Availability
-      if (includeSensorAudit) {
-        doc.setFont('helvetica', 'bold');
-        doc.setFontSize(10.5);
-        doc.setTextColor(15, 23, 42);
-        doc.text('LOCAL SENSOR TELEMETRY & FRESHNESS AUDIT', margin, y);
-        y += 5;
-
-        // Table Header
-        doc.setFillColor(226, 232, 240);
-        doc.rect(margin, y, pageWidth - margin * 2, 6, 'F');
-        doc.setFont('helvetica', 'bold');
-        doc.setFontSize(7.5);
-        doc.setTextColor(51, 65, 85);
-        doc.text('Sensor ID / Name', margin + 3, y + 4.2);
-        doc.text('Freshness State', margin + 55, y + 4.2);
-        doc.text('Current Reading', margin + 95, y + 4.2);
-        doc.text('Telemetry Diagnostics', margin + 130, y + 4.2);
-        y += 7;
-
-        const sensorsToPrint = localSensors.length > 0 ? localSensors : sensors.slice(0, 4);
-        sensorsToPrint.forEach((s) => {
-          doc.setFont('helvetica', 'normal');
-          doc.setFontSize(7.5);
-          doc.setTextColor(30, 41, 59);
-          doc.text(`${s.id} — ${s.name.substring(0, 22)}`, margin + 3, y + 4);
-
-          // State styling
-          if (s.freshnessState === 'FRESH') doc.setTextColor(22, 163, 74);
-          else if (s.freshnessState === 'STALE') doc.setTextColor(202, 138, 4);
-          else doc.setTextColor(220, 38, 38);
-          doc.text(s.freshnessState, margin + 55, y + 4);
-
-          doc.setTextColor(30, 41, 59);
-          doc.text(`${s.currentValue} ${s.unit}`, margin + 95, y + 4);
-          doc.text(`${s.diagnosticNote.substring(0, 35)} (${Math.round(s.confidence * 100)}% conf)`, margin + 130, y + 4);
-
-          y += 5.5;
-        });
-
-        y += 3;
-      }
-
-      // Section: Connected Road Corridors & Mobility
-      if (includeRoadDisruptions && y < 240) {
-        doc.setFont('helvetica', 'bold');
-        doc.setFontSize(10.5);
-        doc.setTextColor(15, 23, 42);
-        doc.text('CONNECTED ROAD NETWORK & MOBILITY IMPACT', margin, y);
-        y += 5;
-
-        const roadsToPrint = localRoads.length > 0 ? localRoads : roads.slice(0, 3);
-        roadsToPrint.forEach((r) => {
-          doc.setFont('helvetica', 'normal');
-          doc.setFontSize(8);
-          doc.setTextColor(15, 23, 42);
-
-          let statusColor: [number, number, number] = [22, 163, 74];
-          if (r.currentState === 'CLOSED') statusColor = [220, 38, 38];
-          else if (r.currentState === 'LIKELY_FLOODED') statusColor = [234, 88, 12];
-          else if (r.currentState === 'AT_RISK') statusColor = [202, 138, 4];
-
-          doc.text(`• ${r.name} (${r.corridorType})`, margin + 2, y + 4);
-          doc.setTextColor(statusColor[0], statusColor[1], statusColor[2]);
-          doc.setFont('helvetica', 'bold');
-          doc.text(`[${r.currentState}]`, margin + 85, y + 4);
-
-          doc.setFont('helvetica', 'normal');
-          doc.setTextColor(71, 85, 105);
-          doc.text(`Est. Depth: ${r.estimatedWaterDepthCm}cm | Delay: +${r.riskPenaltyMin} min`, margin + 115, y + 4);
-          y += 5;
-        });
-
-        y += 3;
-      }
-
-      // Section: Active Emergency Alerts Summary
-      if (includeAlertsSummary && y < 260) {
-        doc.setFont('helvetica', 'bold');
-        doc.setFontSize(10.5);
-        doc.setTextColor(15, 23, 42);
-        doc.text('LOCAL OPERATIONAL ALERTS & DISPATCH DIRECTIVES', margin, y);
-        y += 5;
-
-        if (localAlerts.length === 0) {
-          doc.setFont('helvetica', 'italic');
-          doc.setFontSize(8);
-          doc.setTextColor(100, 116, 139);
-          doc.text('No active critical warnings published specifically for this grid cell.', margin + 3, y + 4);
-          y += 6;
-        } else {
-          localAlerts.slice(0, 2).forEach((al) => {
-            doc.setFont('helvetica', 'bold');
-            doc.setFontSize(8);
-            doc.setTextColor(220, 38, 38);
-            doc.text(`[${al.warningLevel}] ${al.id}: ${al.title.substring(0, 48)}`, margin + 3, y + 4);
-
-            doc.setFont('helvetica', 'normal');
-            doc.setFontSize(7.5);
-            doc.setTextColor(71, 85, 105);
-            doc.text(`Directive: ${al.recommendedAction.substring(0, 85)}`, margin + 3, y + 8);
-            y += 10;
-          });
-        }
-      }
-
-      // Footer disclaimer & Provenance
-      doc.setDrawColor(203, 213, 225);
-      doc.line(margin, 282, pageWidth - margin, 282);
-      doc.setFont('helvetica', 'normal');
-      doc.setFontSize(7);
-      doc.setTextColor(148, 163, 184);
-      doc.text(
-        `Generated by iDhara Command Console. Data Provenance: Mode LIVE, Confidence ${(targetCell.confidence * 100).toFixed(0)}%. Page 1 of 1`,
-        margin,
-        286
-      );
-
-      // Save document
-      const fileName = `iDhara_Report_${targetCell.localityName.replace(/\s+/g, '_')}_${targetCell.id}_${Date.now()}.pdf`;
       doc.save(fileName);
       setDownloadSuccess(true);
     } catch (err) {
-      console.error('Failed to generate PDF', err);
+      console.error('Failed to generate publication PDF', err);
     }
   };
 
-  if (!isOpen) return null;
+  if (!isOpen || !targetCell) return null;
+
+  const riskColor = RISK_COLORS[targetCell.severity];
+  const isHighOrCritical =
+    targetCell.severity === FloodSeverity.HIGH ||
+    targetCell.severity === FloodSeverity.CRITICAL;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-black/80 backdrop-blur-sm animate-in fade-in duration-150">
-      <div className="bg-[#090E1A] border border-cyan-500/30 rounded-lg shadow-2xl w-full max-w-4xl max-h-[92vh] flex flex-col overflow-hidden text-slate-100">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="report-modal-title"
+      className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 md:p-6 bg-black/85 backdrop-blur-md animate-in fade-in duration-150"
+    >
+      <div className="bg-[#090E1A] border border-cyan-500/40 rounded-lg shadow-2xl w-full max-w-5xl max-h-[92vh] flex flex-col overflow-hidden text-slate-100">
         {/* Top Header */}
-        <div className="shrink-0 px-4 py-3.5 bg-[#0C1222] border-b border-slate-800 flex items-center justify-between">
-          <div className="flex items-center gap-2.5">
-            <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 animate-pulse" />
+        <div className="shrink-0 px-4 py-3 bg-[#0C1222] border-b border-slate-800 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 rounded bg-cyan-950 border border-cyan-500/50 flex items-center justify-center text-cyan-400 font-bold text-sm shadow-inner">
+              iD
+            </div>
             <div>
-              <h3 className="text-sm sm:text-base font-semibold text-white tracking-wide">
-                Location PDF Report Generator
+              <h3
+                id="report-modal-title"
+                className="text-sm sm:text-base font-semibold text-white tracking-wide flex items-center gap-2"
+              >
+                <span>Flood Risk & Resilience Assessment Dossier</span>
+                <span className="text-[10px] font-mono uppercase px-2 py-0.5 rounded bg-cyan-950/80 border border-cyan-700/60 text-cyan-300">
+                  A4 Publication Engine
+                </span>
               </h3>
-              <p className="text-[11px] text-cyan-300 font-mono">
-                DATA HEALTH & RESILIENCE → HYDROMETRIC DOSSIER
+              <p className="text-[11px] text-slate-400 font-mono">
+                CENTRAL INDORE 5×5 KM PILOT ZONE · MULTI-FACTOR CATCHMENT INTELLIGENCE
               </p>
             </div>
           </div>
           <button
             type="button"
             onClick={onClose}
-            className="p-1.5 rounded hover:bg-slate-800 text-slate-400 hover:text-white transition-colors cursor-pointer text-sm font-mono"
+            className="p-1.5 px-2.5 rounded hover:bg-slate-800 text-slate-400 hover:text-white transition-colors cursor-pointer text-xs font-mono border border-slate-700/60"
             aria-label="Close Report Modal"
           >
             ✕ Close
           </button>
         </div>
 
-        {/* Scrollable Workspace Body */}
-        <div className="flex-1 min-h-0 overflow-y-auto p-4 sm:p-6 space-y-5 custom-scrollbar">
-          {/* 1. Setup Controls: Map Grid Selector & Searchable Dropdown */}
-          <div className="bg-[#0F172A]/70 border border-slate-800 rounded-md p-4 space-y-4">
-            <div className="flex items-center justify-between border-b border-slate-800/80 pb-2">
-              <span className="text-xs font-mono text-cyan-300 font-semibold uppercase tracking-wider">
-                1. Target Location Selection
-              </span>
-              <span className="text-[11px] text-slate-400">
-                Interactive Grid or Search Dropdown
+        {/* Scrollable Modal Body */}
+        <div className="flex-1 min-h-0 overflow-y-auto p-4 sm:p-5 space-y-5 custom-scrollbar">
+          {/* SECTION 1: TARGET LOCATION SELECTION */}
+          <div className="bg-[#0C1222]/90 border border-slate-800 rounded-lg p-4 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/80 pb-2.5">
+              <div className="flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-cyan-400" />
+                <span className="text-xs font-mono text-cyan-300 font-bold uppercase tracking-wider">
+                  1. Target Locality Selection
+                </span>
+              </div>
+              <span className="text-[11px] text-slate-400 font-mono">
+                Target: <strong className="text-white">{targetCell.localityName}</strong> ({targetCell.wardCode} · {targetCell.id})
               </span>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {/* Searchable Dropdown */}
-              <div className="space-y-1.5">
-                <label className="text-xs text-slate-300 font-medium">Search & Select Locality</label>
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
+              {/* Left Column: Search & Filtered List (5 cols) */}
+              <div className="lg:col-span-5 space-y-2">
+                <label className="text-xs text-slate-300 font-medium block">
+                  Search & Filter Catchment Wards
+                </label>
                 <div className="relative">
                   <input
                     type="text"
                     value={searchFilter}
                     onChange={(e) => setSearchFilter(e.target.value)}
-                    placeholder="Filter locality (e.g. Rajwada, Sarafa, C-2-2)..."
-                    className="w-full bg-[#070B14] border border-slate-700 rounded px-2.5 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-cyan-400 font-mono"
+                    placeholder="Filter locality, ward, or cell ID..."
+                    className="w-full bg-[#070B14] border border-slate-700 rounded px-2.5 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-cyan-400 font-mono pr-7"
                   />
                   {searchFilter && (
                     <button
                       type="button"
                       onClick={() => setSearchFilter('')}
                       className="absolute right-2 top-1.5 text-xs text-slate-400 hover:text-white cursor-pointer"
+                      title="Clear search"
                     >
                       ✕
                     </button>
                   )}
                 </div>
 
-                <select
-                  value={selectedCellId}
-                  onChange={(e) => {
-                    setSelectedCellId(e.target.value);
-                    setGeneratedReportReady(false);
-                  }}
-                  className="w-full mt-1.5 bg-[#070B14] border border-slate-700 rounded px-2.5 py-2 text-xs text-cyan-300 focus:outline-none focus:border-cyan-400 font-mono cursor-pointer"
-                  size={5}
-                >
-                  {filteredCells.map((c) => (
-                    <option key={c.id} value={c.id} className="py-1">
-                      {c.id} — {c.localityName} ({c.wardCode}) [{c.severity}]
-                    </option>
-                  ))}
-                </select>
-                <p className="text-[10px] text-slate-500">
-                  Showing {filteredCells.length} of {cells.length} available wards. Click to choose.
-                </p>
-              </div>
-
-              {/* Map-based Grid Selector */}
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <label className="text-xs text-slate-300 font-medium">Interactive Spatial Grid (Indore Basin)</label>
-                  <span className="text-[10px] font-mono text-cyan-400">
-                    Selected: {targetCell.id}
-                  </span>
-                </div>
-                <div className="bg-[#070B14] border border-slate-800 p-2 rounded grid grid-cols-5 gap-1.5 aspect-video flex items-center justify-center">
-                  {cells.map((c) => {
+                {/* Locality items list */}
+                <div className="bg-[#070B14] border border-slate-800 rounded p-1 max-h-56 overflow-y-auto custom-scrollbar space-y-1">
+                  {filteredCells.map((c) => {
                     const isSelected = c.id === targetCell.id;
-                    let bgColor = 'bg-slate-800/60 hover:bg-slate-700/80 border-slate-700';
+                    const cProb = Math.round(c.floodProbability * 100);
+                    let badgeBg = 'bg-slate-800 text-slate-300 border-slate-700';
                     if (c.severity === FloodSeverity.CRITICAL) {
-                      bgColor = isSelected
-                        ? 'bg-red-600 border-white text-white font-bold ring-2 ring-red-400'
-                        : 'bg-red-950/70 border-red-800 text-red-200 hover:bg-red-900';
+                      badgeBg = 'bg-red-950/80 text-red-300 border-red-800';
                     } else if (c.severity === FloodSeverity.HIGH) {
-                      bgColor = isSelected
-                        ? 'bg-amber-600 border-white text-white font-bold ring-2 ring-amber-400'
-                        : 'bg-amber-950/70 border-amber-800 text-amber-200 hover:bg-amber-900';
-                    } else if (isSelected) {
-                      bgColor = 'bg-cyan-600 border-white text-white font-bold ring-2 ring-cyan-400';
+                      badgeBg = 'bg-amber-950/80 text-amber-300 border-amber-800';
+                    } else if (c.severity === FloodSeverity.MODERATE) {
+                      badgeBg = 'bg-yellow-950/80 text-yellow-300 border-yellow-800';
                     }
 
                     return (
@@ -507,267 +332,575 @@ export const LocationReportModal: React.FC<LocationReportModalProps> = ({
                         onClick={() => {
                           setSelectedCellId(c.id);
                           setGeneratedReportReady(false);
+                          setDownloadSuccess(false);
                         }}
-                        className={`text-[9.5px] font-mono p-1 rounded border transition-all truncate flex flex-col items-center justify-center cursor-pointer ${bgColor}`}
-                        title={`${c.localityName} (${c.id}) — Prob: ${Math.round(c.floodProbability * 100)}%`}
+                        className={`w-full text-left p-2 rounded transition-all flex items-center justify-between text-xs cursor-pointer border ${
+                          isSelected
+                            ? 'bg-cyan-950/70 border-cyan-400 text-white shadow'
+                            : 'hover:bg-slate-800/60 border-transparent text-slate-300'
+                        }`}
                       >
-                        <span className="truncate w-full text-center">{c.id}</span>
-                        <span className="text-[8px] opacity-80">{Math.round(c.floodProbability * 100)}%</span>
+                        <div className="min-w-0 pr-2">
+                          <div className="font-medium truncate text-[11.5px] text-white">
+                            {c.localityName}
+                          </div>
+                          <div className="text-[10px] text-slate-400 font-mono">
+                            {c.wardCode} · {c.id} · {c.elevationM}m MSL
+                          </div>
+                        </div>
+                        <div className="shrink-0 flex items-center gap-1.5 font-mono">
+                          <span className={`text-[10px] px-1.5 py-0.5 rounded border font-semibold ${badgeBg}`}>
+                            {cProb}%
+                          </span>
+                        </div>
                       </button>
                     );
                   })}
+                  {filteredCells.length === 0 && (
+                    <div className="p-3 text-center text-xs text-slate-500 italic">
+                      No wards match “{searchFilter}”
+                    </div>
+                  )}
                 </div>
-                <p className="text-[10.5px] text-slate-400 italic">
-                  Tap any grid cell to focus report generation on that catchment sector.
+                <p className="text-[10.5px] text-slate-400 font-mono">
+                  Showing {filteredCells.length} of {cells.length} catchment wards. Click any item to select.
                 </p>
               </div>
-            </div>
 
-            {/* Reporting Period & Scope Options */}
-            <div className="pt-2 border-t border-slate-800/80 grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
-              <div className="space-y-1">
-                <label className="text-slate-300 font-medium">Reporting Temporal Window</label>
-                <select
-                  value={reportingPeriod}
-                  onChange={(e) => {
-                    setReportingPeriod(e.target.value as ReportingPeriod);
-                    setGeneratedReportReady(false);
-                  }}
-                  className="w-full bg-[#070B14] border border-slate-700 rounded px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-cyan-400 font-sans cursor-pointer"
-                >
-                  <option value="CURRENT_6H">Current Active Window (Past 6 Hours)</option>
-                  <option value="PAST_24H">Historical 24-Hour Cumulative Runoff</option>
-                  <option value="NEXT_12H_FORECAST">Predictive 12-Hour Inundation Outlook</option>
-                  <option value="FULL_INCIDENT">Comprehensive Incident Lifecycle Log</option>
-                </select>
-              </div>
+              {/* Right Column: 8x8 Spatial Catchment Grid (7 cols) */}
+              <div className="lg:col-span-7 space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs text-slate-300 font-medium">
+                    Indore 8×8 Spatial Catchment Grid (Geographic Alignment)
+                  </label>
+                  <span className="text-[10px] font-mono text-cyan-400">
+                    Row {targetCell.row}, Col {targetCell.col}
+                  </span>
+                </div>
 
-              <div className="space-y-1">
-                <label className="text-slate-300 font-medium">Included Telemetry Sections</label>
-                <div className="flex flex-wrap gap-3 pt-1">
-                  <label className="flex items-center gap-1.5 cursor-pointer text-[11px] text-slate-300">
-                    <input
-                      type="checkbox"
-                      checked={includeSensorAudit}
-                      onChange={(e) => setIncludeSensorAudit(e.target.checked)}
-                      className="accent-cyan-400"
-                    />
-                    Sensor Freshness Audit
-                  </label>
-                  <label className="flex items-center gap-1.5 cursor-pointer text-[11px] text-slate-300">
-                    <input
-                      type="checkbox"
-                      checked={includeRoadDisruptions}
-                      onChange={(e) => setIncludeRoadDisruptions(e.target.checked)}
-                      className="accent-cyan-400"
-                    />
-                    Road Mobility Status
-                  </label>
-                  <label className="flex items-center gap-1.5 cursor-pointer text-[11px] text-slate-300">
-                    <input
-                      type="checkbox"
-                      checked={includeAlertsSummary}
-                      onChange={(e) => setIncludeAlertsSummary(e.target.checked)}
-                      className="accent-cyan-400"
-                    />
-                    Active Alerts
-                  </label>
+                <div className="bg-[#070B14] border border-slate-800 p-2.5 rounded-lg space-y-2">
+                  <div className="grid grid-cols-8 gap-1 aspect-auto">
+                    {cells.map((c) => {
+                      const isSelected = c.id === targetCell.id;
+                      const prob = Math.round(c.floodProbability * 100);
+
+                      let bgClass = 'bg-slate-900/90 text-slate-300 border-slate-800 hover:border-slate-600';
+                      if (c.severity === FloodSeverity.CRITICAL) {
+                        bgClass = isSelected
+                          ? 'bg-red-600 border-white text-white font-bold ring-2 ring-red-400'
+                          : 'bg-red-950/70 border-red-800/80 text-red-200 hover:bg-red-900';
+                      } else if (c.severity === FloodSeverity.HIGH) {
+                        bgClass = isSelected
+                          ? 'bg-amber-600 border-white text-white font-bold ring-2 ring-amber-400'
+                          : 'bg-amber-950/70 border-amber-800/80 text-amber-200 hover:bg-amber-900';
+                      } else if (c.severity === FloodSeverity.MODERATE) {
+                        bgClass = isSelected
+                          ? 'bg-yellow-600 border-white text-white font-bold ring-2 ring-yellow-400'
+                          : 'bg-yellow-950/60 border-yellow-800/80 text-yellow-200 hover:bg-yellow-900';
+                      } else if (isSelected) {
+                        bgClass = 'bg-cyan-600 border-white text-white font-bold ring-2 ring-cyan-400';
+                      }
+
+                      return (
+                        <button
+                          key={c.id}
+                          type="button"
+                          onClick={() => {
+                            setSelectedCellId(c.id);
+                            setGeneratedReportReady(false);
+                            setDownloadSuccess(false);
+                          }}
+                          title={`${c.localityName} (${c.wardCode} · ${c.id})\nElevation: ${c.elevationM}m MSL\nFlood Prob: ${prob}%\nSeverity: ${c.severity}`}
+                          className={`h-9 rounded p-0.5 border text-center flex flex-col items-center justify-center transition-all cursor-pointer ${bgClass}`}
+                        >
+                          <span className="text-[8px] font-mono leading-none opacity-80">
+                            R{c.row}C{c.col}
+                          </span>
+                          <span className="text-[9px] font-mono font-bold leading-tight">
+                            {prob}%
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {/* Grid Legend & River Notes */}
+                  <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-800/80 text-[10px] font-mono text-slate-400">
+                    <div className="flex items-center gap-3">
+                      <span className="flex items-center gap-1">
+                        <span className="w-2.5 h-2.5 rounded-sm bg-red-900 border border-red-600" />
+                        Critical (≥70%)
+                      </span>
+                      <span className="flex items-center gap-1">
+                        <span className="w-2.5 h-2.5 rounded-sm bg-amber-900 border border-amber-600" />
+                        High (45-70%)
+                      </span>
+                      <span className="flex items-center gap-1">
+                        <span className="w-2.5 h-2.5 rounded-sm bg-yellow-900 border border-yellow-600" />
+                        Mod (25-45%)
+                      </span>
+                      <span className="flex items-center gap-1">
+                        <span className="w-2.5 h-2.5 rounded-sm bg-slate-800 border border-slate-700" />
+                        Low (&lt;25%)
+                      </span>
+                    </div>
+                    <span className="text-cyan-400">
+                      ★ Active: {targetCell.id}
+                    </span>
+                  </div>
                 </div>
               </div>
             </div>
 
-            <div className="flex justify-end pt-1">
-              <button
-                type="button"
-                onClick={handleGeneratePreview}
-                disabled={isGenerating}
-                className="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-black font-semibold text-xs rounded transition-colors flex items-center gap-2 cursor-pointer disabled:opacity-50"
-              >
-                {isGenerating ? (
-                  <>
-                    <span className="w-3.5 h-3.5 border-2 border-black border-t-transparent rounded-full animate-spin" />
-                    Compiling Data Health Dossier...
-                  </>
-                ) : (
-                  <>⚡ Generate & Preview Report</>
-                )}
-              </button>
+            {/* SECTION 2: REPORT CONFIGURATION OPTIONS */}
+            <div className="pt-3 border-t border-slate-800/80 space-y-3">
+              <div className="flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-cyan-400" />
+                <span className="text-xs font-mono text-cyan-300 font-bold uppercase tracking-wider">
+                  2. Reporting Scope & Dossier Parameters
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+                <div className="space-y-1">
+                  <label className="text-slate-300 font-medium">Reporting Temporal Window</label>
+                  <select
+                    value={reportingPeriod}
+                    onChange={(e) => {
+                      setReportingPeriod(e.target.value as ReportingPeriod);
+                      setGeneratedReportReady(false);
+                    }}
+                    className="w-full bg-[#070B14] border border-slate-700 rounded px-3 py-2 text-xs text-white focus:outline-none focus:border-cyan-400 font-sans cursor-pointer"
+                  >
+                    <option value="CURRENT_6H">Current Active Window (Past 6 Hours)</option>
+                    <option value="PAST_24H">Historical 24-Hour Cumulative Runoff</option>
+                    <option value="NEXT_12H_FORECAST">Predictive 12-Hour Inundation Outlook</option>
+                    <option value="FULL_INCIDENT">Comprehensive Incident Lifecycle Log</option>
+                  </select>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-slate-300 font-medium">Included Intelligence Sections</label>
+                  <div className="grid grid-cols-2 gap-2 pt-1 text-[11px] text-slate-300">
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={includeSpatialGridVisual}
+                        onChange={(e) => setIncludeSpatialGridVisual(e.target.checked)}
+                        className="accent-cyan-400"
+                      />
+                      Spatial Risk-Grid Mini-Map
+                    </label>
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={includeSensorAudit}
+                        onChange={(e) => setIncludeSensorAudit(e.target.checked)}
+                        className="accent-cyan-400"
+                      />
+                      IoT Sensor Freshness Audit
+                    </label>
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={includeRoadDisruptions}
+                        onChange={(e) => setIncludeRoadDisruptions(e.target.checked)}
+                        className="accent-cyan-400"
+                      />
+                      Road Network Mobility Status
+                    </label>
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={includeEvacuationRoute}
+                        onChange={(e) => setIncludeEvacuationRoute(e.target.checked)}
+                        className="accent-cyan-400"
+                      />
+                      Evacuation Route Assessment
+                    </label>
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={includeHistoricalEvents}
+                        onChange={(e) => setIncludeHistoricalEvents(e.target.checked)}
+                        className="accent-cyan-400"
+                      />
+                      Historical Flood Event Records
+                    </label>
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={includePrecautionsPlan}
+                        onChange={(e) => setIncludePrecautionsPlan(e.target.checked)}
+                        className="accent-cyan-400"
+                      />
+                      Precautions & Response Plan
+                    </label>
+                  </div>
+                </div>
+              </div>
+
+              {/* Action trigger button */}
+              <div className="flex justify-end pt-2">
+                <button
+                  type="button"
+                  onClick={handleGeneratePreview}
+                  disabled={isGenerating}
+                  className="px-5 py-2.5 bg-gradient-to-r from-cyan-600 to-cyan-500 hover:from-cyan-500 hover:to-cyan-400 text-black font-semibold text-xs rounded transition-all flex items-center gap-2 cursor-pointer shadow-lg disabled:opacity-50"
+                >
+                  {isGenerating ? (
+                    <>
+                      <span className="w-3.5 h-3.5 border-2 border-black border-t-transparent rounded-full animate-spin" />
+                      <span>Synthesizing Catchment Dossier...</span>
+                    </>
+                  ) : (
+                    <>
+                      <span>⚡</span>
+                      <span>Generate & Review Dossier Preview</span>
+                    </>
+                  )}
+                </button>
+              </div>
             </div>
           </div>
 
-          {/* 2. Compact Report Preview Box */}
+          {/* SECTION 3: LIVE DOSSIER PREVIEW & DOWNLOAD */}
           {generatedReportReady && (
-            <div className="bg-[#0C1220] border-2 border-cyan-500/40 rounded-md p-4 sm:p-5 space-y-4">
-              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
+            <div className="bg-[#0C1220] border-2 border-cyan-500/40 rounded-lg p-4 sm:p-5 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-3">
                 <div>
-                  <span className="text-[10px] font-mono uppercase tracking-wider text-emerald-400 bg-emerald-950/60 px-2 py-0.5 rounded border border-emerald-800">
-                    REPORT READY FOR EXPORT
-                  </span>
-                  <h4 className="text-sm sm:text-base font-bold text-white mt-1">
-                    Dossier Preview: {targetCell.localityName} ({targetCell.wardCode})
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-mono uppercase tracking-wider text-emerald-400 bg-emerald-950/80 px-2 py-0.5 rounded border border-emerald-700">
+                      DOSSIER COMPILED & READY FOR EXPORT
+                    </span>
+                    <span
+                      className="text-[10px] font-mono font-bold px-2 py-0.5 rounded text-white"
+                      style={{ backgroundColor: riskColor.hex }}
+                    >
+                      {riskColor.label}
+                    </span>
+                  </div>
+                  <h4 className="text-base font-bold text-white mt-1">
+                    {targetCell.localityName} ({targetCell.wardCode} · {targetCell.id})
                   </h4>
                   <p className="text-[11px] text-slate-400 font-mono">
-                    Window: {periodLabelMap[reportingPeriod]} • Scope ID: {targetCell.id}
+                    Window: {REPORTING_PERIOD_LABELS[reportingPeriod]} • Elevation: {targetCell.elevationM}m MSL
                   </p>
                 </div>
-                <div className="flex items-center gap-2">
+
+                <div className="flex items-center gap-2.5">
                   <button
                     type="button"
                     onClick={handleDownloadPDF}
-                    className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs rounded shadow-lg transition-all flex items-center gap-2 cursor-pointer"
+                    className="px-4 py-2 bg-gradient-to-r from-emerald-600 to-emerald-500 hover:from-emerald-500 hover:to-emerald-400 text-white font-semibold text-xs rounded shadow-lg transition-all flex items-center gap-2 cursor-pointer border border-emerald-400/30"
                   >
-                    📥 Download PDF
+                    <span>📥</span>
+                    <span>Download Official PDF (A4)</span>
                   </button>
                 </div>
               </div>
 
               {downloadSuccess && (
-                <div className="p-2.5 bg-emerald-950/60 border border-emerald-700/60 rounded text-xs text-emerald-300 font-mono flex items-center gap-2">
-                  <span>✓</span>
-                  <span>PDF successfully created and downloaded to your workstation!</span>
+                <div className="p-3 bg-emerald-950/70 border border-emerald-600/70 rounded text-xs text-emerald-300 font-mono flex items-center gap-2 animate-in fade-in">
+                  <span className="text-base">✓</span>
+                  <div>
+                    <strong>PDF Dossier Downloaded Successfully!</strong> Saved to your local workstation. Includes publication header, risk cards, spatial mini-map, evacuation routing, and municipal history.
+                  </div>
                 </div>
               )}
 
-              {/* Preview Cards */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs font-mono">
-                <div className="p-2.5 bg-[#070B14] border border-slate-800 rounded">
-                  <div className="text-[10px] text-slate-400">Flood Inundation Risk</div>
-                  <div className="text-base font-bold text-red-400">
-                    {Math.round(targetCell.floodProbability * 100)}%
-                  </div>
-                  <div className="text-[10px] text-slate-400">Severity: {targetCell.severity}</div>
-                </div>
-
-                <div className="p-2.5 bg-[#070B14] border border-slate-800 rounded">
-                  <div className="text-[10px] text-slate-400">Rainfall / Runoff</div>
-                  <div className="text-base font-bold text-cyan-300">
-                    {targetCell.rainfallMmHr} mm/h
-                  </div>
-                  <div className="text-[10px] text-slate-400">Cum: {targetCell.cumulativeRainfallMm} mm</div>
-                </div>
-
-                <div className="p-2.5 bg-[#070B14] border border-slate-800 rounded">
-                  <div className="text-[10px] text-slate-400">Telemetry Health</div>
-                  <div className="text-base font-bold text-emerald-400">
-                    {dataHealthReport.overallHealthPct}%
-                  </div>
-                  <div className="text-[10px] text-slate-400">Confidence: {Math.round(targetCell.confidence * 100)}%</div>
-                </div>
-
-                <div className="p-2.5 bg-[#070B14] border border-slate-800 rounded">
-                  <div className="text-[10px] text-slate-400">Warning Hysteresis</div>
-                  <div className="text-base font-bold text-amber-300">
-                    {targetCell.warningLevel}
-                  </div>
-                  <div className="text-[10px] text-slate-400 truncate">
-                    {targetCell.warningHysteresis?.actionDirective || 'ACTIVE'}
-                  </div>
-                </div>
+              {/* Sub-tabs for Preview */}
+              <div className="flex flex-wrap gap-1.5 border-b border-slate-800/80 pb-2 text-xs font-mono">
+                {[
+                  { id: 'summary', label: '1. Executive Summary' },
+                  { id: 'evacuation', label: '2. Evacuation Routes' },
+                  { id: 'historical', label: `3. Historical Events (${verifiedHistRecords.length})` },
+                  { id: 'precautions', label: '4. Response Plan' },
+                  { id: 'telemetry', label: '5. Telemetry & Roads' },
+                ].map((tab) => (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    onClick={() => setActivePreviewTab(tab.id as any)}
+                    className={`px-3 py-1.5 rounded transition-colors cursor-pointer ${
+                      activePreviewTab === tab.id
+                        ? 'bg-cyan-600 text-black font-semibold'
+                        : 'bg-slate-800/80 text-slate-300 hover:bg-slate-700'
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
               </div>
 
-              {/* Inundation Driver Breakdown */}
-              <div className="space-y-1.5">
-                <div className="text-xs font-semibold text-slate-200">Key Contributing Drivers</div>
-                <div className="space-y-1">
-                  {targetCell.topDrivers.map((d, i) => (
-                    <div
-                      key={i}
-                      className="flex items-center justify-between p-2 bg-[#070B14] border border-slate-800/80 rounded text-xs"
-                    >
-                      <div className="flex items-center gap-2">
-                        <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" />
-                        <span className="font-medium text-slate-200">{d.factor}</span>
-                        <span className="text-slate-400 text-[11px]">({d.description})</span>
+              {/* Sub-tab 1: Summary */}
+              {activePreviewTab === 'summary' && (
+                <div className="space-y-3">
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs font-mono">
+                    <div className="p-3 bg-[#070B14] border border-slate-800 rounded">
+                      <div className="text-[10px] text-slate-400">Flood Inundation Probability</div>
+                      <div className="text-xl font-bold text-red-400">
+                        {Math.round(targetCell.floodProbability * 100)}%
                       </div>
-                      <span className="font-mono text-cyan-300 font-semibold">{d.weight}% impact</span>
+                      <div className="text-[10px] text-slate-400">Predicted Depth: {targetCell.predictedDepthCm} cm</div>
                     </div>
-                  ))}
-                </div>
-              </div>
 
-              {/* Data Availability & Sensor Audit Summary */}
-              {includeSensorAudit && (
-                <div className="space-y-1.5">
-                  <div className="text-xs font-semibold text-slate-200 flex items-center justify-between">
-                    <span>Associated Sensor Health & Availability</span>
-                    <span className="text-[10px] font-mono text-cyan-400">
-                      {localSensors.length > 0 ? `${localSensors.length} Stations in Basin` : 'Regional Mesh'}
-                    </span>
+                    <div className="p-3 bg-[#070B14] border border-slate-800 rounded">
+                      <div className="text-[10px] text-slate-400">Rainfall Intensity / Cum</div>
+                      <div className="text-xl font-bold text-cyan-300">
+                        {targetCell.rainfallMmHr} mm/h
+                      </div>
+                      <div className="text-[10px] text-slate-400">Cumulative: {targetCell.cumulativeRainfallMm} mm</div>
+                    </div>
+
+                    <div className="p-3 bg-[#070B14] border border-slate-800 rounded">
+                      <div className="text-[10px] text-slate-400">Vulnerable Population (Est.)</div>
+                      <div className="text-xl font-bold text-indigo-300">
+                        ~{targetCell.populationEstimate.toLocaleString()}
+                      </div>
+                      <div className="text-[10px] text-slate-400">10-Yr Flood Count: {targetCell.historicalFloodCount10Yr} events</div>
+                    </div>
+
+                    <div className="p-3 bg-[#070B14] border border-slate-800 rounded">
+                      <div className="text-[10px] text-slate-400">Telemetry Health / Quality</div>
+                      <div className="text-xl font-bold text-emerald-400">
+                        {dataHealthReport.overallHealthPct}%
+                      </div>
+                      <div className="text-[10px] text-slate-400">Model Conf: {Math.round(targetCell.confidence * 100)}%</div>
+                    </div>
                   </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                    {(localSensors.length > 0 ? localSensors : sensors.slice(0, 4)).map((s) => (
-                      <div
-                        key={s.id}
-                        className="p-2 bg-[#070B14] border border-slate-800 rounded text-xs flex items-center justify-between font-mono"
-                      >
+
+                  <div className="p-3 bg-[#070B14] border border-slate-800 rounded space-y-1.5 text-xs">
+                    <div className="font-semibold text-slate-200">Contributing Hydrological Drivers</div>
+                    <div className="space-y-1">
+                      {targetCell.topDrivers.map((d, i) => (
+                        <div
+                          key={i}
+                          className="flex items-center justify-between p-2 bg-[#0A0F1D] rounded text-slate-300"
+                        >
+                          <div className="flex items-center gap-2">
+                            <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" />
+                            <span className="font-medium text-white">{d.factor}</span>
+                            <span className="text-slate-400 text-[11px]">({d.description})</span>
+                          </div>
+                          <span className="font-mono text-cyan-300 font-bold">{d.weight}% influence</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Sub-tab 2: Evacuation */}
+              {activePreviewTab === 'evacuation' && (
+                <div className="space-y-3 text-xs">
+                  <div className="p-3 bg-[#070B14] border border-slate-800 rounded space-y-2">
+                    <div className="font-semibold text-cyan-300 font-mono flex items-center justify-between">
+                      <span>B. Current Recommended Route [Calculated Route]</span>
+                      <span className="text-[10px] text-slate-400">
+                        Assigned Shelter: {targetCell.nearestShelterId}
+                      </span>
+                    </div>
+
+                    {previewEvacRoute && previewEvacRoute.feasible && previewEvacRoute.primaryRoute ? (
+                      <div className="space-y-1 text-slate-300">
                         <div>
-                          <div className="text-slate-200 font-semibold text-[11px] truncate">{s.name}</div>
-                          <div className="text-[10px] text-slate-400">
-                            Reading: {s.currentValue} {s.unit} • Last seen: {s.lastSeenLabel}
+                          <strong>Route Path:</strong> {previewEvacRoute.primaryRoute.roadNames.join(' ➔ ')}
+                        </div>
+                        <div className="font-mono text-cyan-200">
+                          Distance: {previewEvacRoute.primaryRoute.distanceKm} km · ETA: {previewEvacRoute.primaryRoute.travelTimeMin} min (includes flood risk penalty)
+                        </div>
+                        <div className="text-[11px] text-slate-400">
+                          Safety Policy: Avoids CLOSED and submerged segments for patient/emergency safety.
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="text-red-400 font-medium">
+                        NO FEASIBLE ROUTE AVAILABLE: All corridors severed by CLOSED or flooded road segments.
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="p-3 bg-[#070B14] border border-slate-800 rounded space-y-1">
+                    <div className="font-semibold text-slate-200 font-mono">
+                      A. Historical Evacuation Route Used [Historical Record]
+                    </div>
+                    {verifiedHistRecords.some((r) => r.routesActuallyUsed) ? (
+                      <div className="text-slate-300 space-y-0.5">
+                        {verifiedHistRecords
+                          .filter((r) => r.routesActuallyUsed)
+                          .map((r) => (
+                            <div key={r.recordId} className="text-[11px]">
+                              • {r.eventDate}: {r.routesActuallyUsed} (Dest: {r.sheltersOrDestinationsUsed})
+                            </div>
+                          ))}
+                      </div>
+                    ) : (
+                      <div className="text-slate-400 italic text-[11px]">
+                        No verified historical evacuation route records exist for this location.
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="p-3 bg-[#070B14] border border-slate-800 rounded space-y-1">
+                    <div className="font-semibold text-slate-200 font-mono">
+                      C. Alternative Evacuation Route [Calculated Route]
+                    </div>
+                    {previewEvacRoute?.alternativeRoute ? (
+                      <div className="text-slate-300 text-[11px] space-y-0.5">
+                        <div>Path: {previewEvacRoute.alternativeRoute.roadNames.join(' ➔ ')}</div>
+                        <div className="text-cyan-300 font-mono">
+                          Distance: {previewEvacRoute.alternativeRoute.distanceKm} km · ETA: {previewEvacRoute.alternativeRoute.travelTimeMin} min
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="text-slate-400 italic text-[11px]">
+                        No viable alternative bypass route exists without traversing high-hazard or closed road segments.
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Sub-tab 3: Historical Events */}
+              {activePreviewTab === 'historical' && (
+                <div className="space-y-3 text-xs">
+                  {verifiedHistRecords.length > 0 ? (
+                    verifiedHistRecords.map((rec) => (
+                      <div key={rec.recordId} className="p-3 bg-[#070B14] border border-slate-800 rounded space-y-2">
+                        <div className="flex items-center justify-between border-b border-slate-800 pb-1.5">
+                          <span className="font-semibold text-amber-300 font-mono">
+                            {rec.eventTitle}
+                          </span>
+                          <span className="text-[10px] font-mono text-slate-400">
+                            {rec.recordId} · {rec.eventDate}
+                          </span>
+                        </div>
+                        <div className="space-y-1 text-slate-300 text-[11.5px]">
+                          <div><strong>Conditions & Impact:</strong> {rec.recordedFloodConditions}</div>
+                          <div><strong>Precautions Taken:</strong> {rec.precautionsTaken}</div>
+                          <div><strong>Actions Performed:</strong> {rec.actionsPerformedByAuthorities}</div>
+                          <div><strong>Evacuation Measures:</strong> {rec.evacuationMeasuresTaken}</div>
+                          <div><strong>Routes & Shelters:</strong> {rec.routesActuallyUsed} (Dest: {rec.sheltersOrDestinationsUsed})</div>
+                          <div className="text-[10px] text-slate-400 font-mono pt-1">
+                            Source: {rec.sourceReference}
                           </div>
                         </div>
-                        <span
-                          className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
-                            s.freshnessState === 'FRESH'
-                              ? 'bg-emerald-950 text-emerald-400 border border-emerald-800'
-                              : s.freshnessState === 'STALE'
-                              ? 'bg-amber-950 text-amber-400 border border-amber-800'
-                              : 'bg-red-950 text-red-400 border border-red-800'
-                          }`}
-                        >
-                          {s.freshnessState}
-                        </span>
                       </div>
-                    ))}
-                  </div>
+                    ))
+                  ) : (
+                    <div className="p-4 bg-[#070B14] border border-slate-800 rounded space-y-2">
+                      <div className="text-slate-300 font-semibold">
+                        No verified historical flood response records are available for this location in the current data sources.
+                      </div>
+                      <div className="text-slate-400 text-xs">
+                        • 10-Year Municipal Inundation Frequency: {targetCell.historicalFloodCount10Yr} events catalogued.<br />
+                        • Local Terrain Context: {targetCell.historicalContext || 'Standard urban catchment terrain.'}
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
 
-              {/* Local Road Disruptions & Alerts Count */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs pt-1">
-                {includeRoadDisruptions && (
-                  <div className="p-2.5 bg-[#070B14] border border-slate-800 rounded space-y-1">
-                    <div className="font-semibold text-slate-300">Corridor Mobility</div>
-                    <div className="text-[11px] text-slate-400">
-                      {localRoads.length} arterial/collector roads surveyed.
-                      {localRoads.some((r) => r.currentState === 'CLOSED') ? (
-                        <span className="text-red-400 font-medium ml-1">Critical closures active.</span>
-                      ) : (
-                        <span className="text-emerald-400 font-medium ml-1">Transit passages passable.</span>
-                      )}
-                    </div>
+              {/* Sub-tab 4: Precautions Plan */}
+              {activePreviewTab === 'precautions' && (
+                <div className="p-3 bg-[#070B14] border border-slate-800 rounded space-y-2 text-xs">
+                  <div className="font-semibold text-cyan-300 font-mono">
+                    Recommended Precautions & Response Plan (Dossier Preview)
                   </div>
-                )}
+                  <ul className="space-y-1.5 text-slate-300 text-[11.5px]">
+                    <li className="flex items-start gap-2">
+                      <span className="text-cyan-400 font-bold">1.</span>
+                      <span><strong>Waterway & Telemetry Surveillance:</strong> Continuous monitoring of upstream river stage gauges and rainfall rates.</span>
+                    </li>
+                    <li className="flex items-start gap-2">
+                      <span className="text-cyan-400 font-bold">2.</span>
+                      <span><strong>Official Public Alerts:</strong> Disseminate alerts via Indore 311 app, public sirens, and SMS cell-broadcast to Ward {targetCell.wardCode}.</span>
+                    </li>
+                    <li className="flex items-start gap-2">
+                      <span className="text-cyan-400 font-bold">3.</span>
+                      <span><strong>Vulnerable Population Register:</strong> Pre-identify basement and ground-floor dwellers requiring special transport assistance.</span>
+                    </li>
+                    <li className="flex items-start gap-2">
+                      <span className="text-cyan-400 font-bold">4.</span>
+                      <span><strong>Refuge Shelter Readiness:</strong> Confirm readiness and supplies at {targetCell.nearestShelterId} on elevated ground.</span>
+                    </li>
+                    <li className="flex items-start gap-2">
+                      <span className="text-cyan-400 font-bold">5.</span>
+                      <span><strong>Corridor Barricading:</strong> Enforce complete traffic barricades at low-level bridge and underpass approaches.</span>
+                    </li>
+                  </ul>
+                </div>
+              )}
 
-                {includeAlertsSummary && (
-                  <div className="p-2.5 bg-[#070B14] border border-slate-800 rounded space-y-1">
-                    <div className="font-semibold text-slate-300">Directives & Alerts</div>
-                    <div className="text-[11px] text-slate-400">
-                      {localAlerts.length > 0 ? (
-                        <span className="text-amber-300 font-medium">
-                          {localAlerts.length} active emergency alert(s) logged for this catchment.
-                        </span>
-                      ) : (
-                        <span className="text-slate-400">No active localized evacuation order.</span>
-                      )}
+              {/* Sub-tab 5: Telemetry & Roads */}
+              {activePreviewTab === 'telemetry' && (
+                <div className="space-y-3 text-xs">
+                  {/* Nearby Sensors */}
+                  <div className="p-3 bg-[#070B14] border border-slate-800 rounded space-y-1.5">
+                    <div className="font-semibold text-slate-200">Associated Sensor Telemetry ({localSensors.length} Stations)</div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 font-mono">
+                      {(localSensors.length > 0 ? localSensors : sensors.slice(0, 4)).map((s) => (
+                        <div key={s.id} className="p-2 bg-[#0A0F1D] rounded flex items-center justify-between">
+                          <div>
+                            <div className="text-white font-medium text-[11px] truncate">{s.name}</div>
+                            <div className="text-slate-400 text-[10px]">
+                              {s.currentValue} {s.unit} · {s.diagnosticNote}
+                            </div>
+                          </div>
+                          <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
+                            s.freshnessState === 'FRESH'
+                              ? 'text-emerald-400 bg-emerald-950/80 border border-emerald-800'
+                              : 'text-amber-400 bg-amber-950/80 border border-amber-800'
+                          }`}>
+                            {s.freshnessState}
+                          </span>
+                        </div>
+                      ))}
                     </div>
                   </div>
-                )}
-              </div>
+
+                  {/* Connected Roads */}
+                  <div className="p-3 bg-[#070B14] border border-slate-800 rounded space-y-1.5">
+                    <div className="font-semibold text-slate-200">Connected Road Network ({localRoads.length} Corridors)</div>
+                    <div className="space-y-1 text-[11px] font-mono">
+                      {(localRoads.length > 0 ? localRoads : roads.slice(0, 3)).map((r) => (
+                        <div key={r.id} className="p-2 bg-[#0A0F1D] rounded flex items-center justify-between">
+                          <div>
+                            <span className="text-white font-medium">{r.name}</span>
+                            <span className="text-slate-400 text-[10px] ml-2">({r.corridorType})</span>
+                          </div>
+                          <span className={`font-bold px-1.5 py-0.5 rounded text-[10px] ${
+                            r.currentState === 'CLOSED'
+                              ? 'text-red-400 bg-red-950/80'
+                              : r.currentState === 'LIKELY_FLOODED'
+                              ? 'text-orange-400 bg-orange-950/80'
+                              : r.currentState === 'AT_RISK'
+                              ? 'text-amber-400 bg-amber-950/80'
+                              : 'text-emerald-400 bg-emerald-950/80'
+                          }`}>
+                            {r.currentState}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </div>
 
-        {/* Modal Footer */}
+        {/* Modal Sticky Footer */}
         <div className="shrink-0 px-4 py-3 bg-[#0C1222] border-t border-slate-800 flex items-center justify-between">
           <div className="text-[11px] text-slate-400 font-mono">
-            Location: <span className="text-cyan-300 font-semibold">{targetCell.localityName}</span> ({targetCell.id})
+            Selected: <span className="text-cyan-300 font-semibold">{targetCell.localityName}</span> ({targetCell.wardCode} · {targetCell.id})
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2.5">
             <button
               type="button"
               onClick={onClose}
-              className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-xs transition-colors cursor-pointer"
+              className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-xs transition-colors cursor-pointer border border-slate-700"
             >
               Close
             </button>
@@ -775,9 +908,10 @@ export const LocationReportModal: React.FC<LocationReportModalProps> = ({
               <button
                 type="button"
                 onClick={handleDownloadPDF}
-                className="px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-black font-semibold rounded text-xs transition-colors flex items-center gap-1.5 cursor-pointer"
+                className="px-4 py-1.5 bg-gradient-to-r from-cyan-600 to-cyan-500 hover:from-cyan-500 hover:to-cyan-400 text-black font-semibold rounded text-xs transition-colors flex items-center gap-1.5 cursor-pointer shadow-md"
               >
-                📥 Download PDF
+                <span>📥</span>
+                <span>Download PDF</span>
               </button>
             )}
           </div>
