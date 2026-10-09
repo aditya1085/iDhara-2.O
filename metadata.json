@@ -1,0 +1,8 @@
+{
+  "name": "iDhara — Urban Flood Prediction & Disaster Twin",
+  "description": "From Prediction to Protection. Intelligent urban flood prediction, disaster twin, routing, and emergency response platform for the Indore 5x5 km pilot zone.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
