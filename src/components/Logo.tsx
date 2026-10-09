@@ -75,8 +75,8 @@ export const Logo: React.FC<LogoProps> = ({
             </svg>
           )}
         </div>
-        {/* Radar live pulse ring */}
-        <div className="absolute -inset-0.5 rounded-full border border-cyan-400/30 animate-ping pointer-events-none opacity-40" />
+        {/* Radar subtle static indicator ring */}
+        <div className="absolute -inset-0.5 rounded-full border border-cyan-400/25 pointer-events-none opacity-40" />
       </div>
 
       {/* Brand Typography & Subtitle */}

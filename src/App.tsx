@@ -299,6 +299,7 @@ export default function App() {
   ]);
 
   const {
+    rainfall,
     sensors,
     cells,
     roads,
@@ -1152,6 +1153,25 @@ export default function App() {
     return () => window.clearInterval(pulseTimer);
   }, [cells, sensors, roads, activeRoute]);
 
+  // Live Telemetry Streaming Loop (When in LIVE mode, simulates real-time sensor updates)
+  useEffect(() => {
+    if (params.mode !== ProductMode.LIVE) return;
+    const liveTimer = window.setInterval(() => {
+      updateParamsWithHysteresis((prev) => {
+        if (prev.mode !== ProductMode.LIVE) return prev;
+        const jitterSteps = [-1, 0, 1, 0];
+        const step = Math.floor(Math.random() * jitterSteps.length);
+        const nextRain = Math.max(38, Math.min(46, prev.rainfallIntensityMmHr + jitterSteps[step]));
+        return {
+          ...prev,
+          rainfallIntensityMmHr: nextRain,
+        };
+      });
+    }, 4500);
+
+    return () => window.clearInterval(liveTimer);
+  }, [params.mode]);
+
   const systemEnvelope = useMemo(
     () =>
       wrapInEnvelope(
@@ -1525,7 +1545,7 @@ export default function App() {
   return (
     <div className="flex flex-col h-screen w-screen bg-[#06090F] text-slate-100 overflow-hidden font-sans">
       {/* 1. TOP COMMAND & STATUS BAR — EMERGENCY OPERATIONS CENTER TELEMETRY */}
-      <header className="h-11 px-3 bg-[#080D18] border-b border-slate-800 flex items-center justify-between gap-2.5 text-xs font-mono shrink-0 select-none overflow-x-auto">
+      <header className="h-11 px-3 bg-[#080D18] border-b border-slate-800 flex items-center justify-between gap-2.5 text-xs font-mono shrink-0 select-none overflow-hidden">
         {/* Left: Nav Toggle & Operational Unit */}
         <div className="flex items-center gap-2 shrink-0">
           <button
@@ -1540,7 +1560,7 @@ export default function App() {
           <Logo size="sm" />
         </div>
 
-        {/* Center: PRIMARY EOC METRICS (MODE · LOCATION · RISK · RAINFALL · CONFIDENCE · HEALTH) */}
+        {/* Center: PRIMARY EOC METRICS (MODE · LOCATION · RAINFALL · CONFIDENCE) */}
         <div className="flex items-center gap-2 text-xs font-mono shrink-0">
           {/* Mode Selector Segmented Control */}
           <div className="flex items-center bg-[#0A101D] border border-slate-800 p-0.5 rounded-none">
@@ -1599,23 +1619,16 @@ export default function App() {
             LOC: Indore Pilot (5×5 km)
           </span>
           <span
-            className={`px-2 py-0.5 border text-[11px] font-bold ${
-              overallPilotRisk === FloodSeverity.CRITICAL
-                ? 'bg-rose-950/80 text-rose-300 border-rose-600/70'
-                : overallPilotRisk === FloodSeverity.HIGH
-                ? 'bg-amber-950/80 text-amber-300 border-amber-600/70'
-                : overallPilotRisk === FloodSeverity.MODERATE
-                ? 'bg-yellow-950/80 text-yellow-300 border-yellow-600/70'
-                : 'bg-emerald-950/80 text-emerald-300 border-emerald-600/70'
-            }`}
+            className="px-2 py-0.5 bg-[#0D1422] border border-slate-800 text-cyan-300 text-[11px] font-mono tabular-nums inline-flex items-center justify-center min-w-[96px] text-center"
+            title={`Effective Rainfall: ${rainfall.effectiveMmHr} mm/h (Base: ${params.rainfallIntensityMmHr} mm/h + Injected: ${rainfall.injectedBurstMmHr} mm/h)`}
           >
-            RISK: {overallPilotRisk}
+            RAIN: {rainfall.effectiveMmHr} mm/h
           </span>
-          <span className="px-2 py-0.5 bg-[#0D1422] border border-slate-800 text-cyan-300 text-[11px] hidden md:inline">
-            RAIN: {params.rainfallIntensityMmHr} mm/h
-          </span>
-          <span className="px-2 py-0.5 bg-[#0D1422] border border-slate-800 text-indigo-300 text-[11px] hidden lg:inline">
-            CONF: {dataHealthReport.confidence}%
+          <span
+            className="px-2 py-0.5 bg-[#0D1422] border border-slate-800 text-indigo-300 text-[11px] font-mono tabular-nums inline-flex items-center justify-center min-w-[76px] text-center"
+            title={`System Confidence: ${Math.round(dataHealthReport.confidence * 100)}% based on active sensor mesh and telemetry freshness`}
+          >
+            CONF: {Math.round(dataHealthReport.confidence * 100)}%
           </span>
         </div>
 
