@@ -2,7 +2,20 @@ import { INTERSECTION_NODES, PILOT_BOUNDS, PILOT_SCOPE_ID } from '../data/indore
 import { evaluateAuthoritativePrototypeData } from '../modules/prototypeDataStore';
 import { DEFAULT_INJECTED_OBSERVATIONS } from '../modules/dataIngestion';
 import { DEFAULT_EVACUATION_CONFIG } from '../modules/evacuation';
-import { DisasterStage, MapSurfaceMetric, ProductMode, ScenarioParameters } from '../types/idhara';
+import {
+  DisasterStage,
+  FloodSeverity,
+  MapSurfaceMetric,
+  ProductMode,
+  ScenarioParameters,
+} from '../types/idhara';
+import {
+  DEFAULT_RISK_CATEGORY_TOGGLES,
+  filterCellsByRiskToggles,
+  getCellGeographicBounds,
+  latToMapY,
+  lngToMapX,
+} from '../components/IndoreFloodMap';
 
 console.log('=== PHASE 1: MAP UI & INTERACTION VERIFICATION ===\n');
 
@@ -37,10 +50,28 @@ console.assert(PILOT_BOUNDS.maxLat === 22.7490, 'Pilot maxLat matches 5x5km boun
 console.assert(PILOT_SCOPE_ID === 'IND-PILOT-5X5-CENTRAL', 'Scope matches');
 console.log('[TEST 1] Pilot Boundary: PASSED');
 
-// Verify all 64 cells have valid names, ward codes, and coordinates
-const cellNames = new Set(store.cells.map(c => c.localityName));
+// Verify all 64 cells have valid names, ward codes, and geographic alignment
+const cellNames = new Set(store.cells.map((c) => c.localityName));
 console.assert(cellNames.size === 64, 'All 64 study area names must be distinct');
-console.log('[TEST 1] All 64 Study Areas Verified Unique & Complete: PASSED');
+
+for (const cell of store.cells) {
+  const bounds = getCellGeographicBounds(cell);
+  const centerX = lngToMapX(cell.lng);
+  const centerY = latToMapY(cell.lat);
+  console.assert(
+    Math.abs(bounds.x + bounds.width / 2 - centerX) < 1.5,
+    `Cell ${cell.id} X bounds must align with cell longitude ${cell.lng}`
+  );
+  console.assert(
+    Math.abs(bounds.y + bounds.height / 2 - centerY) < 1.5,
+    `Cell ${cell.id} Y bounds must align with cell latitude ${cell.lat}`
+  );
+  console.assert(
+    Math.abs(bounds.x - cell.col * 125) < 0.01 && Math.abs(bounds.y - cell.row * 125) < 0.01,
+    `Cell ${cell.id} bounds must align with 8x8 geographic grid`
+  );
+}
+console.log('[TEST 1] All 64 Study Areas & Geographic Bounds Verified: PASSED');
 
 // 2. Verify all 6 views are valid
 const views: MapSurfaceMetric[] = [
@@ -92,4 +123,99 @@ console.assert(store.sensors.length === 10, 'Expected 10 sensor gauges');
 console.assert(store.shelters.length === 4, 'Expected 4 relief shelters');
 console.log('[TEST 5] Assets and Infrastructure Data: PASSED');
 
+// 6. Verify 4 Independent Multi-Select Risk Category Toggles (Green, Yellow, Orange, Red)
+const lowCells = store.cells.filter((c) => c.severity === FloodSeverity.LOW);
+const modCells = store.cells.filter((c) => c.severity === FloodSeverity.MODERATE);
+const highCells = store.cells.filter((c) => c.severity === FloodSeverity.HIGH);
+const critCells = store.cells.filter((c) => c.severity === FloodSeverity.CRITICAL);
+
+console.log(
+  `[TEST 6] Category distribution — Green(LOW): ${lowCells.length}, Yellow(MODERATE): ${modCells.length}, Orange(HIGH): ${highCells.length}, Red(CRITICAL): ${critCells.length}`
+);
+
+// All OFF
+const allOff = filterCellsByRiskToggles(store.cells, {
+  GREEN: false,
+  YELLOW: false,
+  ORANGE: false,
+  RED: false,
+});
+console.assert(allOff.length === 0, 'All toggles OFF must return 0 overlay cells');
+
+// Green ON only
+const greenOnly = filterCellsByRiskToggles(store.cells, {
+  GREEN: true,
+  YELLOW: false,
+  ORANGE: false,
+  RED: false,
+});
+console.assert(
+  greenOnly.length === lowCells.length &&
+    greenOnly.every((c) => c.severity === FloodSeverity.LOW),
+  'Green ON only must return only LOW risk cells'
+);
+
+// Yellow ON only
+const yellowOnly = filterCellsByRiskToggles(store.cells, {
+  GREEN: false,
+  YELLOW: true,
+  ORANGE: false,
+  RED: false,
+});
+console.assert(
+  yellowOnly.length === modCells.length &&
+    yellowOnly.every((c) => c.severity === FloodSeverity.MODERATE),
+  'Yellow ON only must return only MODERATE risk cells'
+);
+
+// Orange ON only
+const orangeOnly = filterCellsByRiskToggles(store.cells, {
+  GREEN: false,
+  YELLOW: false,
+  ORANGE: true,
+  RED: false,
+});
+console.assert(
+  orangeOnly.length === highCells.length &&
+    orangeOnly.every((c) => c.severity === FloodSeverity.HIGH),
+  'Orange ON only must return only HIGH risk cells'
+);
+
+// Red ON only
+const redOnly = filterCellsByRiskToggles(store.cells, {
+  GREEN: false,
+  YELLOW: false,
+  ORANGE: false,
+  RED: true,
+});
+console.assert(
+  redOnly.length === critCells.length &&
+    redOnly.every((c) => c.severity === FloodSeverity.CRITICAL),
+  'Red ON only must return only CRITICAL risk cells'
+);
+
+// Combination: Orange + Red ON
+const orangeAndRed = filterCellsByRiskToggles(store.cells, {
+  GREEN: false,
+  YELLOW: false,
+  ORANGE: true,
+  RED: true,
+});
+console.assert(
+  orangeAndRed.length === highCells.length + critCells.length &&
+    orangeAndRed.every(
+      (c) => c.severity === FloodSeverity.HIGH || c.severity === FloodSeverity.CRITICAL
+    ),
+  'Orange + Red ON must return exact union of HIGH and CRITICAL cells'
+);
+
+// All four ON
+const allOn = filterCellsByRiskToggles(store.cells, DEFAULT_RISK_CATEGORY_TOGGLES);
+console.assert(allOn.length === 64, 'All four toggles ON must return all 64 cells');
+
+// Ensure underlying cells array and records are not mutated
+console.assert(store.cells.length === 64, 'Underlying cells count must remain 64');
+console.log('[TEST 6] Four Independent Multi-Select Risk Toggles Verified: PASSED');
+
 console.log('\n=== ALL PHASE 1 MAP UI VERIFICATION TESTS PASSED ===');
+

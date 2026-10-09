@@ -1,7 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ContextInspectorPanel } from './components/ContextInspectorPanel';
 import { DisasterTwinWorkspace } from './components/DisasterTwinWorkspace';
-import { IndoreFloodMap, MapInspectionTarget } from './components/IndoreFloodMap';
+import {
+  DEFAULT_RISK_CATEGORY_TOGGLES,
+  IndoreFloodMap,
+  MapInspectionTarget,
+  RiskCategoryToggles,
+} from './components/IndoreFloodMap';
 import { Logo } from './components/Logo';
 import { ModuleWorkspace } from './components/ModuleWorkspaces';
 import { MODE_META, SEVERITY_META, WARNING_LEVEL_META } from './components/SeverityVisuals';
@@ -211,6 +216,9 @@ export default function App() {
     cellLabels: true,
   });
   const [isMapLegendCollapsed, setIsMapLegendCollapsed] = useState<boolean>(false);
+  const [mapRiskToggles, setMapRiskToggles] = useState<RiskCategoryToggles>(
+    DEFAULT_RISK_CATEGORY_TOGGLES
+  );
 
   const [customOriginId, setCustomOriginId] = useState<string>('NODE-RAJWADA');
   const [customDestId, setCustomDestId] = useState<string>('NODE-MY-HOSPITAL');
@@ -1917,6 +1925,8 @@ export default function App() {
                   onMetricOverlayChange={setMapMetricOverlay}
                   layers={mapLayers}
                   onLayersChange={setMapLayers}
+                  riskToggles={mapRiskToggles}
+                  onRiskTogglesChange={setMapRiskToggles}
                   isLegendCollapsed={isMapLegendCollapsed}
                   onLegendCollapsedChange={setIsMapLegendCollapsed}
                 />
@@ -2069,6 +2079,8 @@ export default function App() {
                   onMetricOverlayChange={setMapMetricOverlay}
                   layers={mapLayers}
                   onLayersChange={setMapLayers}
+                  riskToggles={mapRiskToggles}
+                  onRiskTogglesChange={setMapRiskToggles}
                   isLegendCollapsed={isMapLegendCollapsed}
                   onLegendCollapsedChange={setIsMapLegendCollapsed}
                 />

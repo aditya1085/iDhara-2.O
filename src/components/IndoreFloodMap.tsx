@@ -30,6 +30,113 @@ export type MapInspectionTarget =
   | { type: 'SHELTER'; id: string }
   | { type: 'ASSET'; id: string };
 
+export interface RiskCategoryToggles {
+  GREEN: boolean;
+  YELLOW: boolean;
+  ORANGE: boolean;
+  RED: boolean;
+}
+
+export const DEFAULT_RISK_CATEGORY_TOGGLES: RiskCategoryToggles = {
+  GREEN: true,
+  YELLOW: true,
+  ORANGE: true,
+  RED: true,
+};
+
+export function isCellRiskCategoryEnabled(
+  cell: FloodRiskCell,
+  toggles: RiskCategoryToggles
+): boolean {
+  switch (cell.severity) {
+    case FloodSeverity.LOW:
+      return toggles.GREEN;
+    case FloodSeverity.MODERATE:
+      return toggles.YELLOW;
+    case FloodSeverity.HIGH:
+      return toggles.ORANGE;
+    case FloodSeverity.CRITICAL:
+      return toggles.RED;
+    default:
+      return false;
+  }
+}
+
+export function filterCellsByRiskToggles(
+  cells: FloodRiskCell[],
+  toggles: RiskCategoryToggles
+): FloodRiskCell[] {
+  return cells.filter((cell) => isCellRiskCategoryEnabled(cell, toggles));
+}
+
+export function lngToMapX(lng: number): number {
+  return ((lng - PILOT_BOUNDS.minLng) / (PILOT_BOUNDS.maxLng - PILOT_BOUNDS.minLng)) * 1000;
+}
+
+export function latToMapY(lat: number): number {
+  return ((PILOT_BOUNDS.maxLat - lat) / (PILOT_BOUNDS.maxLat - PILOT_BOUNDS.minLat)) * 1000;
+}
+
+export function getCellGeographicBounds(cell: Pick<FloodRiskCell, 'row' | 'col'>) {
+  const latStep = (PILOT_BOUNDS.maxLat - PILOT_BOUNDS.minLat) / 8;
+  const lngStep = (PILOT_BOUNDS.maxLng - PILOT_BOUNDS.minLng) / 8;
+  const northLat = PILOT_BOUNDS.maxLat - cell.row * latStep;
+  const southLat = PILOT_BOUNDS.maxLat - (cell.row + 1) * latStep;
+  const westLng = PILOT_BOUNDS.minLng + cell.col * lngStep;
+  const eastLng = PILOT_BOUNDS.minLng + (cell.col + 1) * lngStep;
+  const x = lngToMapX(westLng);
+  const y = latToMapY(northLat);
+  const width = lngToMapX(eastLng) - x;
+  const height = latToMapY(southLat) - y;
+  return { northLat, southLat, westLng, eastLng, x, y, width, height };
+}
+
+function tileXToLng(tx: number, z: number): number {
+  return (tx / Math.pow(2, z)) * 360 - 180;
+}
+
+function tileYToLat(ty: number, z: number): number {
+  const n = Math.PI - (2 * Math.PI * ty) / Math.pow(2, z);
+  return (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+}
+
+interface GeographicTileDescriptor {
+  key: string;
+  url: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+const INDORE_BASEMAP_TILES: GeographicTileDescriptor[] = (() => {
+  const z = 14;
+  const subdomains = ['a', 'b', 'c'];
+  const tiles: GeographicTileDescriptor[] = [];
+  for (let tx = 11640; tx <= 11649; tx++) {
+    for (let ty = 7163; ty <= 7170; ty++) {
+      const westLng = tileXToLng(tx, z);
+      const eastLng = tileXToLng(tx + 1, z);
+      const northLat = tileYToLat(ty, z);
+      const southLat = tileYToLat(ty + 1, z);
+      const x = lngToMapX(westLng);
+      const y = latToMapY(northLat);
+      const width = lngToMapX(eastLng) - x;
+      const height = latToMapY(southLat) - y;
+      const sub = subdomains[Math.abs(tx + ty) % subdomains.length];
+      tiles.push({
+        key: `${z}-${tx}-${ty}`,
+        url: `https://${sub}.basemaps.cartocdn.com/dark_all/${z}/${tx}/${ty}@2x.png`,
+        x,
+        y,
+        width: width + 0.6,
+        height: height + 0.6,
+      });
+    }
+  }
+  return tiles;
+})();
+
 interface IndoreFloodMapProps {
   mode: ProductMode;
   cells: FloodRiskCell[];
@@ -59,6 +166,8 @@ interface IndoreFloodMapProps {
   onMetricOverlayChange?: (metric: MapSurfaceMetric) => void;
   layers?: Record<string, boolean>;
   onLayersChange?: (layers: Record<string, boolean>) => void;
+  riskToggles?: RiskCategoryToggles;
+  onRiskTogglesChange?: (toggles: RiskCategoryToggles) => void;
   isLegendCollapsed?: boolean;
   onLegendCollapsedChange?: (collapsed: boolean) => void;
 }
@@ -101,6 +210,8 @@ export const IndoreFloodMap: React.FC<IndoreFloodMapProps> = ({
   onMetricOverlayChange,
   layers: controlledLayers,
   onLayersChange,
+  riskToggles: controlledRiskToggles,
+  onRiskTogglesChange,
   isLegendCollapsed: controlledLegendCollapsed,
   onLegendCollapsedChange,
 }) => {
@@ -173,6 +284,27 @@ export const IndoreFloodMap: React.FC<IndoreFloodMapProps> = ({
     else setInternalLegendCollapsed(nextVal);
   };
 
+  const [internalRiskToggles, setInternalRiskToggles] =
+    useState<RiskCategoryToggles>(DEFAULT_RISK_CATEGORY_TOGGLES);
+  const riskToggles = controlledRiskToggles ?? internalRiskToggles;
+  const setRiskToggles = (
+    updater:
+      | RiskCategoryToggles
+      | ((prev: RiskCategoryToggles) => RiskCategoryToggles)
+  ) => {
+    const nextVal =
+      typeof updater === 'function' ? updater(riskToggles) : updater;
+    if (onRiskTogglesChange) onRiskTogglesChange(nextVal);
+    else setInternalRiskToggles(nextVal);
+  };
+
+  const toggleRiskCategory = (category: keyof RiskCategoryToggles) => {
+    setRiskToggles((prev) => ({
+      ...prev,
+      [category]: !prev[category],
+    }));
+  };
+
   const [hoveredInfo, setHoveredInfo] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [isSearchOpen, setIsSearchOpen] = useState<boolean>(false);
@@ -182,6 +314,61 @@ export const IndoreFloodMap: React.FC<IndoreFloodMapProps> = ({
   const [isRouteErrorDismissed, setIsRouteErrorDismissed] =
     useState<boolean>(false);
   const [isScaleVisible, setIsScaleVisible] = useState<boolean>(false);
+
+  // Track viewport container size via ResizeObserver so the geographic map
+  // fills the entire available width and height while preserving 1:1 proportions.
+  const viewportContainerRef = useRef<HTMLDivElement>(null);
+  const [viewportSize, setViewportSize] = useState<{
+    width: number;
+    height: number;
+  }>({ width: 1200, height: 750 });
+
+  useEffect(() => {
+    const el = viewportContainerRef.current;
+    if (!el) return;
+
+    const updateDimensions = () => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        setViewportSize((prev) => {
+          const nextW = Math.round(rect.width);
+          const nextH = Math.round(rect.height);
+          if (prev.width === nextW && prev.height === nextH) return prev;
+          return { width: nextW, height: nextH };
+        });
+      }
+    };
+
+    updateDimensions();
+
+    if (typeof ResizeObserver !== 'undefined') {
+      const observer = new ResizeObserver(() => {
+        updateDimensions();
+      });
+      observer.observe(el);
+      return () => observer.disconnect();
+    } else {
+      window.addEventListener('resize', updateDimensions);
+      return () => window.removeEventListener('resize', updateDimensions);
+    }
+  }, []);
+
+  // Compute aspect-ratio-matched SVG viewBox so the geographic map fills 100% of
+  // width & height without stretching or leaving unused black sidebars.
+  const aspect =
+    viewportSize.width > 0 && viewportSize.height > 0
+      ? viewportSize.width / viewportSize.height
+      : 1.5;
+  const baseSpan = 1040;
+  const viewHeight = (aspect >= 1 ? baseSpan : baseSpan / aspect) / (zoom || 1);
+  const viewWidth = (aspect >= 1 ? baseSpan * aspect : baseSpan) / (zoom || 1);
+  const cameraCenterX = 500 - panOffset.x;
+  const cameraCenterY = 500 - panOffset.y;
+  const viewMinX = Number((cameraCenterX - viewWidth / 2).toFixed(2));
+  const viewMinY = Number((cameraCenterY - viewHeight / 2).toFixed(2));
+  const dynamicViewBox = `${viewMinX} ${viewMinY} ${Number(
+    viewWidth.toFixed(2)
+  )} ${Number(viewHeight.toFixed(2))}`;
 
   // Map panning via mouse drag
   const [isDragging, setIsDragging] = useState<boolean>(false);
@@ -222,18 +409,22 @@ export const IndoreFloodMap: React.FC<IndoreFloodMapProps> = ({
 
   const handleViewportMouseMove = (e: React.MouseEvent) => {
     if (!isDragging) return;
-    const dx = (e.clientX - dragStartRef.current.x) / (zoom || 1);
-    const dy = (e.clientY - dragStartRef.current.y) / (zoom || 1);
-    if (Math.hypot(dx, dy) > 4) {
+    const pixelDx = e.clientX - dragStartRef.current.x;
+    const pixelDy = e.clientY - dragStartRef.current.y;
+    if (Math.hypot(pixelDx, pixelDy) > 4) {
       dragStartRef.current.moved = true;
     }
+    const unitsPerPixel =
+      viewportSize.height > 0 ? viewHeight / viewportSize.height : 1 / (zoom || 1);
+    const dx = pixelDx * unitsPerPixel;
+    const dy = pixelDy * unitsPerPixel;
     const nextPanX = Math.max(
-      -480,
-      Math.min(480, Math.round(dragStartRef.current.panX + dx))
+      -640,
+      Math.min(640, Math.round(dragStartRef.current.panX + dx))
     );
     const nextPanY = Math.max(
-      -480,
-      Math.min(480, Math.round(dragStartRef.current.panY + dy))
+      -520,
+      Math.min(520, Math.round(dragStartRef.current.panY + dy))
     );
     setPanOffset({ x: nextPanX, y: nextPanY });
   };
@@ -272,21 +463,26 @@ export const IndoreFloodMap: React.FC<IndoreFloodMapProps> = ({
     setIsRouteErrorDismissed(false);
   }, [activeRoute?.id, activeRoute?.feasible]);
 
-  // Center and focus map only when a NEW selectedArea is chosen
-  const prevSelectedAreaIdRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (selectedArea && selectedArea.id !== prevSelectedAreaIdRef.current) {
-      prevSelectedAreaIdRef.current = selectedArea.id;
-      const cellCenterX = (selectedArea.col + 0.5) * cellSize;
-      const cellCenterY = (selectedArea.row + 0.5) * cellSize;
-      const offsetX = Math.max(-320, Math.min(320, 500 - cellCenterX));
-      const offsetY = Math.max(-320, Math.min(320, 500 - cellCenterY));
-      setPanOffset({ x: Math.round(offsetX), y: Math.round(offsetY) });
-      setZoom((z) => (z < 1.3 ? 1.35 : z));
-    } else if (!selectedArea) {
-      prevSelectedAreaIdRef.current = null;
-    }
-  }, [selectedArea?.id, cellSize]);
+  // Filtered risk cells based on the 4 independent multi-select risk toggles
+  const visibleRiskCells = useMemo(
+    () => filterCellsByRiskToggles(cells, riskToggles),
+    [cells, riskToggles]
+  );
+
+  // Category counts for the 4 independent toggles (does not alter underlying data)
+  const riskCategoryCounts = useMemo(() => {
+    let green = 0;
+    let yellow = 0;
+    let orange = 0;
+    let red = 0;
+    cells.forEach((c) => {
+      if (c.severity === FloodSeverity.LOW) green++;
+      else if (c.severity === FloodSeverity.MODERATE) yellow++;
+      else if (c.severity === FloodSeverity.HIGH) orange++;
+      else if (c.severity === FloodSeverity.CRITICAL) red++;
+    });
+    return { GREEN: green, YELLOW: yellow, ORANGE: orange, RED: red };
+  }, [cells]);
 
   const selectedAreaOriginNodeId = useMemo(() => {
     if (!selectedArea) return null;
@@ -688,7 +884,7 @@ export const IndoreFloodMap: React.FC<IndoreFloodMapProps> = ({
                 setZoom(1);
                 setPanOffset({ x: 0, y: 0 });
               }}
-              className="px-2 py-1 text-[11px] text-slate-300 tabular-nums border-x border-slate-800 hover:text-cyan-300 cursor-pointer"
+              className="px-2 py-1 text-[11px] text-slate-300 tabular-nums border-x border-slate-800 hover:text-cyan-300 cursor-pointer min-w-[46px] text-center"
               title="Click to reset zoom to 100%"
             >
               {Math.round(zoom * 100)}%
@@ -705,13 +901,147 @@ export const IndoreFloodMap: React.FC<IndoreFloodMapProps> = ({
         </div>
       </div>
 
+      {/* Four Independent Multi-Select Risk Category Toggles Bar (Green, Yellow, Orange, Red) */}
+      <div
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()}
+        className="flex items-center justify-between gap-2 px-2.5 sm:px-3 h-9 min-h-[36px] max-h-[36px] bg-[#080C15] border-b border-slate-800/90 z-20 shrink-0 font-mono text-[11px] overflow-x-auto no-scrollbar"
+      >
+        <div className="flex items-center gap-1.5 shrink-0">
+          <span className="text-slate-400 text-[10px] uppercase tracking-wider mr-1">
+            Risk Overlays:
+          </span>
+
+          {/* GREEN Toggle: Low Risk */}
+          <button
+            type="button"
+            aria-pressed={riskToggles.GREEN}
+            aria-label="Toggle Green Low Risk Cells"
+            onClick={() => toggleRiskCategory('GREEN')}
+            className={`px-2 py-0.5 border text-[10.5px] font-mono tabular-nums inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap ${
+              riskToggles.GREEN
+                ? 'bg-emerald-950/80 border-emerald-500/80 text-emerald-300 font-semibold'
+                : 'bg-[#060911] border-slate-800 text-slate-500 hover:text-slate-300'
+            }`}
+            title="Toggle Green (Low Risk) cell overlays independently"
+          >
+            <span
+              className={`w-2 h-2 rounded-xs ${
+                riskToggles.GREEN ? 'bg-emerald-400' : 'bg-slate-700'
+              }`}
+            />
+            <span>Green · Low ({riskCategoryCounts.GREEN})</span>
+          </button>
+
+          {/* YELLOW Toggle: Moderate Risk */}
+          <button
+            type="button"
+            aria-pressed={riskToggles.YELLOW}
+            aria-label="Toggle Yellow Moderate Risk Cells"
+            onClick={() => toggleRiskCategory('YELLOW')}
+            className={`px-2 py-0.5 border text-[10.5px] font-mono tabular-nums inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap ${
+              riskToggles.YELLOW
+                ? 'bg-yellow-950/80 border-yellow-500/80 text-yellow-300 font-semibold'
+                : 'bg-[#060911] border-slate-800 text-slate-500 hover:text-slate-300'
+            }`}
+            title="Toggle Yellow (Moderate Risk) cell overlays independently"
+          >
+            <span
+              className={`w-2 h-2 rounded-xs ${
+                riskToggles.YELLOW ? 'bg-yellow-400' : 'bg-slate-700'
+              }`}
+            />
+            <span>Yellow · Moderate ({riskCategoryCounts.YELLOW})</span>
+          </button>
+
+          {/* ORANGE Toggle: High Risk */}
+          <button
+            type="button"
+            aria-pressed={riskToggles.ORANGE}
+            aria-label="Toggle Orange High Risk Cells"
+            onClick={() => toggleRiskCategory('ORANGE')}
+            className={`px-2 py-0.5 border text-[10.5px] font-mono tabular-nums inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap ${
+              riskToggles.ORANGE
+                ? 'bg-orange-950/80 border-orange-500/80 text-orange-300 font-semibold'
+                : 'bg-[#060911] border-slate-800 text-slate-500 hover:text-slate-300'
+            }`}
+            title="Toggle Orange (High Risk) cell overlays independently"
+          >
+            <span
+              className={`w-2 h-2 rounded-xs ${
+                riskToggles.ORANGE ? 'bg-orange-400' : 'bg-slate-700'
+              }`}
+            />
+            <span>Orange · High ({riskCategoryCounts.ORANGE})</span>
+          </button>
+
+          {/* RED Toggle: Critical Risk */}
+          <button
+            type="button"
+            aria-pressed={riskToggles.RED}
+            aria-label="Toggle Red Critical Risk Cells"
+            onClick={() => toggleRiskCategory('RED')}
+            className={`px-2 py-0.5 border text-[10.5px] font-mono tabular-nums inline-flex items-center gap-1.5 transition-colors cursor-pointer whitespace-nowrap ${
+              riskToggles.RED
+                ? 'bg-rose-950/80 border-rose-500/80 text-rose-300 font-semibold'
+                : 'bg-[#060911] border-slate-800 text-slate-500 hover:text-slate-300'
+            }`}
+            title="Toggle Red (Critical Risk) cell overlays independently"
+          >
+            <span
+              className={`w-2 h-2 rounded-xs ${
+                riskToggles.RED ? 'bg-rose-500' : 'bg-slate-700'
+              }`}
+            />
+            <span>Red · Critical ({riskCategoryCounts.RED})</span>
+          </button>
+        </div>
+
+        <div className="flex items-center gap-1.5 shrink-0">
+          <span className="text-[10px] text-slate-400 tabular-nums hidden md:inline">
+            Showing {visibleRiskCells.length}/{cells.length} cells
+          </span>
+          <button
+            type="button"
+            onClick={() =>
+              setRiskToggles({
+                GREEN: true,
+                YELLOW: true,
+                ORANGE: true,
+                RED: true,
+              })
+            }
+            className="px-1.5 py-0.5 bg-[#0D1422] hover:bg-slate-800 border border-slate-700 text-[10px] text-cyan-300 cursor-pointer whitespace-nowrap"
+            title="Enable all four risk category overlays"
+          >
+            All ON
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              setRiskToggles({
+                GREEN: false,
+                YELLOW: false,
+                ORANGE: false,
+                RED: false,
+              })
+            }
+            className="px-1.5 py-0.5 bg-[#0D1422] hover:bg-slate-800 border border-slate-700 text-[10px] text-slate-300 hover:text-white cursor-pointer whitespace-nowrap"
+            title="Turn off all risk category overlays to inspect the base geographic map"
+          >
+            All OFF
+          </button>
+        </div>
+      </div>
+
       {/* Main Interactive SVG Geospatial Viewport with Click & Drag to Pan */}
       <div
+        ref={viewportContainerRef}
         onMouseDown={handleViewportMouseDown}
         onMouseMove={handleViewportMouseMove}
         onMouseUp={handleViewportMouseUp}
         onMouseLeave={handleViewportMouseUp}
-        className={`relative flex-1 w-full h-full overflow-hidden flex items-center justify-center bg-[#04070D] geospatial-grid-bg select-none ${
+        className={`relative flex-1 min-h-0 w-full h-full overflow-hidden bg-[#060A12] select-none ${
           isDragging ? 'cursor-grabbing' : 'cursor-grab'
         }`}
       >
@@ -1024,12 +1354,9 @@ export const IndoreFloodMap: React.FC<IndoreFloodMapProps> = ({
         )}
 
         <svg
-          viewBox="-25 -25 1050 1050"
-          className="w-full h-full max-h-full cursor-crosshair"
-          style={{
-            transform: `scale(${zoom}) translate(${panOffset.x}px, ${panOffset.y}px)`,
-            transformOrigin: 'center center',
-          }}
+          viewBox={dynamicViewBox}
+          preserveAspectRatio="xMidYMid meet"
+          className="block w-full h-full cursor-crosshair"
           role="img"
           aria-label="Indore 5 by 5 kilometer interactive flood prediction heatmap and disaster twin map"
         >
@@ -1068,6 +1395,27 @@ export const IndoreFloodMap: React.FC<IndoreFloodMapProps> = ({
             >
               <circle cx="4" cy="4" r="1.5" fill="rgba(250, 204, 21, 0.55)" />
               <circle cx="10" cy="10" r="1.5" fill="rgba(250, 204, 21, 0.55)" />
+            </pattern>
+
+            <pattern
+              id="indore-urban-grid-pattern"
+              width="62.5"
+              height="62.5"
+              patternUnits="userSpaceOnUse"
+            >
+              <rect width="62.5" height="62.5" fill="#070C16" />
+              <path
+                d="M 62.5 0 L 0 0 0 62.5"
+                fill="none"
+                stroke="rgba(30, 41, 59, 0.55)"
+                strokeWidth="0.9"
+              />
+              <path
+                d="M 31.25 0 L 31.25 62.5 M 0 31.25 L 62.5 31.25"
+                fill="none"
+                stroke="rgba(30, 41, 59, 0.28)"
+                strokeWidth="0.6"
+              />
             </pattern>
 
             <radialGradient id="heatmap-critical" cx="50%" cy="50%" r="50%">
@@ -1115,10 +1463,90 @@ export const IndoreFloodMap: React.FC<IndoreFloodMapProps> = ({
             </marker>
           </defs>
 
-          {/* 0. Continuous Flood-Risk Heatmap Glow Underlay */}
+          {/* BASE LAYER A: Full-Viewport Indore Geographic Vector Base & Coordinate Graticules */}
+          <g pointerEvents="none" aria-hidden="true">
+            <rect
+              x="-2000"
+              y="-1400"
+              width="5000"
+              height="3800"
+              fill="url(#indore-urban-grid-pattern)"
+            />
+
+            {/* Extended Indore Metropolitan Arterial & Ring Road Network (Beyond 5x5 km Pilot Core) */}
+            <g stroke="#1E293B" strokeWidth="2.4" fill="none" opacity="0.85">
+              {/* Airport Road / Super Corridor West Extension */}
+              <polyline points="-1200,40 -600,75 85,110" />
+              {/* Dhar Road / Western Bypass */}
+              <polyline points="-1200,480 -550,390 195,310" />
+              {/* Annapurna / Sudama Nagar West Arterial */}
+              <polyline points="-1100,880 -480,790 110,690" />
+              {/* Western Ring Road (North-South West Flank) */}
+              <polyline points="-480,-700 -520,120 -500,620 -460,1500" strokeWidth="3.2" />
+              {/* Ujjain Road / Sanwer Industrial North Extension */}
+              <polyline points="315,-800 312,115" />
+              <polyline points="810,135 980,-650" />
+              {/* Eastern Ring Road & Vijay Nagar / Bypass Connectors */}
+              <polyline points="810,135 1380,40 1950,-180" />
+              <polyline points="890,380 1450,360 2100,340" strokeWidth="3.2" />
+              <polyline points="825,695 1420,720 2050,760" />
+              <polyline points="565,880 1380,960 2000,1040" />
+              <polyline points="1420,-700 1440,360 1420,960 1400,1600" strokeWidth="3.6" />
+              {/* AB Road South (Rau / Mhow Highway) & Khandwa Road */}
+              <polyline points="335,780 180,1550" />
+              <polyline points="565,880 540,1650" strokeWidth="3.2" />
+              {/* Western Railway Broad-Gauge Line (Indore Junction Corridor) */}
+              <polyline
+                points="480,-700 545,130 560,315 555,445 530,880 490,1600"
+                stroke="#334155"
+                strokeWidth="2"
+                strokeDasharray="8 6"
+              />
+            </g>
+
+            {/* Extended Kahn & Saraswati River Channels Outside 5x5 km Box */}
+            <g fill="none" stroke="rgba(14, 165, 233, 0.24)" strokeWidth="12" strokeLinecap="round">
+              <polyline points="315,30 330,-350 370,-800" />
+              <polyline points="560,980 610,1320 680,1650" />
+              <polyline points="180,970 95,1290 -40,1620" />
+            </g>
+
+            {/* Surrounding Indore Neighborhood Context Labels */}
+            <g
+              fill="#475569"
+              fontSize="11"
+              fontFamily="IBM Plex Mono, monospace"
+              fontWeight="600"
+            >
+              <text x="-380" y="95">← AIRPORT RD / KALANI NAGAR</text>
+              <text x="-380" y="370">← CHANDAN NAGAR / DHAR RD</text>
+              <text x="-380" y="760">← ANNAPURNA / SUDAMA NAGAR W</text>
+              <text x="1080" y="110">VIJAY NAGAR / MR-10 →</text>
+              <text x="1080" y="355">SAKET / KHJRANA / RING RD →</text>
+              <text x="1080" y="710">PIPLIYAHANA / TILAK NAGAR →</text>
+              <text x="1080" y="945">BICHOLI MARDANA / BYPASS →</text>
+            </g>
+          </g>
+
+          {/* BASE LAYER B: Real Geographic Web Mercator Dark Map Tiles (CartoDB / OpenStreetMap) Aligned to PILOT_BOUNDS */}
+          <g pointerEvents="none" opacity="0.88">
+            {INDORE_BASEMAP_TILES.map((tile) => (
+              <image
+                key={tile.key}
+                href={tile.url}
+                x={tile.x}
+                y={tile.y}
+                width={tile.width}
+                height={tile.height}
+                preserveAspectRatio="none"
+              />
+            ))}
+          </g>
+
+          {/* 0. Continuous Flood-Risk Heatmap Glow Underlay (Filtered by active Risk Category Toggles) */}
           {layers.heatmapGlow &&
             (metricOverlay === 'FLOOD_PROBABILITY' || metricOverlay === 'SEVERITY') &&
-            cells
+            visibleRiskCells
               .filter(
                 (c) =>
                   c.severity === FloodSeverity.CRITICAL ||
@@ -1144,11 +1572,11 @@ export const IndoreFloodMap: React.FC<IndoreFloodMapProps> = ({
                 );
               })}
 
-          {/* 0B. Signature Iso-Risk Topographic Contours (74% CRITICAL & 52% HIGH Iso-Lines) */}
+          {/* 0B. Signature Iso-Risk Topographic Contours (Filtered by active Risk Category Toggles) */}
           {layers.riskContours &&
             (metricOverlay === 'FLOOD_PROBABILITY' || metricOverlay === 'SEVERITY') && (
               <g pointerEvents="none">
-                {cells
+                {visibleRiskCells
                   .filter((c) => c.floodProbability >= 0.52)
                   .map((c) => {
                     const cx = (c.col + 0.5) * cellSize;
@@ -1197,30 +1625,39 @@ export const IndoreFloodMap: React.FC<IndoreFloodMapProps> = ({
               </g>
             )}
 
-          {/* 1. 64-Cell Hydrological Risk Grid */}
+          {/* 1. 64-Cell Hydrological Risk Grid (Aligned to Geographic Coordinates & Filtered by 4 Risk Toggles) */}
           {layers.gridCells &&
-            cells.map((cell) => {
-              const x = cell.col * cellSize;
-              const y = cell.row * cellSize;
+            visibleRiskCells.map((cell) => {
+              const geoRect = getCellGeographicBounds(cell);
+              const x = geoRect.x;
+              const y = geoRect.y;
               const isSelected =
                 (selectedTarget?.type === 'CELL' && selectedTarget?.id === cell.id) ||
                 selectedArea?.id === cell.id;
               const sevMeta = SEVERITY_META[cell.severity];
 
-              // Compute fill based on active 5-metric overlay
-              let fillStyle = sevMeta.svgFill;
-              if (metricOverlay === 'FLOOD_PROBABILITY') {
-                const p = cell.floodProbability;
-                fillStyle =
-                  p >= 0.74
-                    ? 'rgba(239, 68, 68, 0.36)'
-                    : p >= 0.52
-                    ? 'rgba(249, 115, 22, 0.28)'
-                    : p >= 0.30
-                    ? 'rgba(234, 179, 8, 0.20)'
-                    : 'rgba(16, 185, 129, 0.09)';
-              } else if (metricOverlay === 'SEVERITY') {
-                fillStyle = sevMeta.svgFill;
+              // Category-aligned semi-transparent fill and outline so geographic features underneath remain readable
+              const categoryFill =
+                cell.severity === FloodSeverity.CRITICAL
+                  ? 'rgba(239, 68, 68, 0.36)'
+                  : cell.severity === FloodSeverity.HIGH
+                  ? 'rgba(249, 115, 22, 0.30)'
+                  : cell.severity === FloodSeverity.MODERATE
+                  ? 'rgba(234, 179, 8, 0.24)'
+                  : 'rgba(16, 185, 129, 0.20)';
+
+              const categoryStroke =
+                cell.severity === FloodSeverity.CRITICAL
+                  ? 'rgba(239, 68, 68, 0.82)'
+                  : cell.severity === FloodSeverity.HIGH
+                  ? 'rgba(249, 115, 22, 0.76)'
+                  : cell.severity === FloodSeverity.MODERATE
+                  ? 'rgba(234, 179, 8, 0.70)'
+                  : 'rgba(16, 185, 129, 0.65)';
+
+              let fillStyle = categoryFill;
+              if (metricOverlay === 'FLOOD_PROBABILITY' || metricOverlay === 'SEVERITY') {
+                fillStyle = categoryFill;
               } else if (metricOverlay === 'UNCERTAINTY') {
                 const u = cell.uncertaintyBand;
                 fillStyle =
@@ -1258,13 +1695,10 @@ export const IndoreFloodMap: React.FC<IndoreFloodMapProps> = ({
                   (isFnPocket && cell.floodProbability >= 0.41);
 
                 if (!predFlood && obsFlood) {
-                  // FALSE NEGATIVE — Visually Prominent Crimson
                   fillStyle = 'rgba(244, 63, 94, 0.52)';
                 } else if (predFlood && obsFlood) {
-                  // TRUE POSITIVE — Verified Emerald
                   fillStyle = 'rgba(16, 185, 129, 0.34)';
                 } else if (predFlood && !obsFlood) {
-                  // FALSE POSITIVE — Over-warn Amber
                   fillStyle = 'rgba(245, 158, 11, 0.30)';
                 } else {
                   fillStyle = 'rgba(15, 23, 42, 0.45)';
@@ -1282,7 +1716,7 @@ export const IndoreFloodMap: React.FC<IndoreFloodMapProps> = ({
                   }}
                   onMouseEnter={() =>
                     setHoveredInfo(
-                      `${cell.id} · ${cell.localityName} (${cell.wardCode}) · Prob ${Math.round(
+                      `${cell.id} · ${cell.localityName} (${cell.wardCode}) · ${cell.lat}°N, ${cell.lng}°E · Prob ${Math.round(
                         cell.floodProbability * 100
                       )}% · Sev ${sevMeta.label} · Warn ${cell.warningLevel} · Conf ${Math.round(
                         cell.confidence * 100
@@ -1295,11 +1729,11 @@ export const IndoreFloodMap: React.FC<IndoreFloodMapProps> = ({
                   <rect
                     x={x}
                     y={y}
-                    width={cellSize}
-                    height={cellSize}
+                    width={geoRect.width}
+                    height={geoRect.height}
                     fill={fillStyle}
-                    stroke={isSelected ? '#38BDF8' : 'rgba(51, 65, 85, 0.5)'}
-                    strokeWidth={isSelected ? 3 : 1}
+                    stroke={isSelected ? '#38BDF8' : categoryStroke}
+                    strokeWidth={isSelected ? 3 : 1.25}
                   />
 
                   {layers.patterns &&
@@ -1431,25 +1865,25 @@ export const IndoreFloodMap: React.FC<IndoreFloodMapProps> = ({
                 {/* NW Reticle */}
                 <path d="M 6,18 L 30,18 M 18,6 L 18,30" />
                 <text x="34" y="22" fill="#7DD3FC" fontSize="9" fontFamily="IBM Plex Mono, monospace" stroke="none">
-                  22.7500°N · 75.8450°E
+                  {PILOT_BOUNDS.maxLat.toFixed(4)}°N · {PILOT_BOUNDS.minLng.toFixed(4)}°E
                 </text>
 
                 {/* NE Reticle */}
                 <path d="M 970,18 L 994,18 M 982,6 L 982,30" />
                 <text x="965" y="22" textAnchor="end" fill="#7DD3FC" fontSize="9" fontFamily="IBM Plex Mono, monospace" stroke="none">
-                  22.7500°N · 75.8950°E
+                  {PILOT_BOUNDS.maxLat.toFixed(4)}°N · {PILOT_BOUNDS.maxLng.toFixed(4)}°E
                 </text>
 
                 {/* SW Reticle */}
                 <path d="M 6,982 L 30,982 M 18,970 L 18,994" />
                 <text x="34" y="986" fill="#7DD3FC" fontSize="9" fontFamily="IBM Plex Mono, monospace" stroke="none">
-                  22.7050°N · 75.8450°E
+                  {PILOT_BOUNDS.minLat.toFixed(4)}°N · {PILOT_BOUNDS.minLng.toFixed(4)}°E
                 </text>
 
                 {/* SE Reticle */}
                 <path d="M 970,982 L 994,982 M 982,970 L 982,994" />
                 <text x="965" y="986" textAnchor="end" fill="#7DD3FC" fontSize="9" fontFamily="IBM Plex Mono, monospace" stroke="none">
-                  22.7050°N · 75.8950°E
+                  {PILOT_BOUNDS.minLat.toFixed(4)}°N · {PILOT_BOUNDS.maxLng.toFixed(4)}°E
                 </text>
               </g>
 
@@ -2128,7 +2562,9 @@ export const IndoreFloodMap: React.FC<IndoreFloodMapProps> = ({
             })}
 
           {/* 9. Area Selection / Highlight Overlay (Prominent, High-Contrast Reticle & Focus Frame) */}
-          {selectedArea && (
+          {selectedArea &&
+            layers.gridCells &&
+            isCellRiskCategoryEnabled(selectedArea, riskToggles) && (
             <g pointerEvents="none">
               <rect
                 x={selectedArea.col * cellSize}
@@ -2219,23 +2655,63 @@ export const IndoreFloodMap: React.FC<IndoreFloodMapProps> = ({
             </div>
 
             {(metricOverlay === 'FLOOD_PROBABILITY' || metricOverlay === 'SEVERITY') && (
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-1.5">
-                <div className="flex items-center gap-1 text-rose-400">
-                  <span>✖ RED / CRIT</span>
-                  <span className="text-[10px] text-slate-400">(≥74%)</span>
-                </div>
-                <div className="flex items-center gap-1 text-amber-400">
-                  <span>▲ ORANGE / HIGH</span>
-                  <span className="text-[10px] text-slate-400">(52–73%)</span>
-                </div>
-                <div className="flex items-center gap-1 text-yellow-300">
-                  <span>◆ YELLOW / MOD</span>
-                  <span className="text-[10px] text-slate-400">(30–51%)</span>
-                </div>
-                <div className="flex items-center gap-1 text-emerald-400">
-                  <span>● GREEN / LOW</span>
-                  <span className="text-[10px] text-slate-400">(&lt;30%)</span>
-                </div>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5 mb-1.5">
+                <button
+                  type="button"
+                  aria-pressed={riskToggles.RED}
+                  onClick={() => toggleRiskCategory('RED')}
+                  className={`flex items-center gap-1 px-1.5 py-0.5 border text-left transition-colors cursor-pointer ${
+                    riskToggles.RED
+                      ? 'text-rose-400 border-rose-500/50 bg-rose-950/40'
+                      : 'text-slate-500 border-slate-800 bg-slate-900/40 line-through'
+                  }`}
+                  title="Toggle Red / Critical risk cells"
+                >
+                  <span>✖ RED</span>
+                  <span className="text-[9.5px] text-slate-400">(≥74%)</span>
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={riskToggles.ORANGE}
+                  onClick={() => toggleRiskCategory('ORANGE')}
+                  className={`flex items-center gap-1 px-1.5 py-0.5 border text-left transition-colors cursor-pointer ${
+                    riskToggles.ORANGE
+                      ? 'text-amber-400 border-amber-500/50 bg-amber-950/40'
+                      : 'text-slate-500 border-slate-800 bg-slate-900/40 line-through'
+                  }`}
+                  title="Toggle Orange / High risk cells"
+                >
+                  <span>▲ ORANGE</span>
+                  <span className="text-[9.5px] text-slate-400">(52–73%)</span>
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={riskToggles.YELLOW}
+                  onClick={() => toggleRiskCategory('YELLOW')}
+                  className={`flex items-center gap-1 px-1.5 py-0.5 border text-left transition-colors cursor-pointer ${
+                    riskToggles.YELLOW
+                      ? 'text-yellow-300 border-yellow-500/50 bg-yellow-950/40'
+                      : 'text-slate-500 border-slate-800 bg-slate-900/40 line-through'
+                  }`}
+                  title="Toggle Yellow / Moderate risk cells"
+                >
+                  <span>◆ YELLOW</span>
+                  <span className="text-[9.5px] text-slate-400">(30–51%)</span>
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={riskToggles.GREEN}
+                  onClick={() => toggleRiskCategory('GREEN')}
+                  className={`flex items-center gap-1 px-1.5 py-0.5 border text-left transition-colors cursor-pointer ${
+                    riskToggles.GREEN
+                      ? 'text-emerald-400 border-emerald-500/50 bg-emerald-950/40'
+                      : 'text-slate-500 border-slate-800 bg-slate-900/40 line-through'
+                  }`}
+                  title="Toggle Green / Low risk cells"
+                >
+                  <span>● GREEN</span>
+                  <span className="text-[9.5px] text-slate-400">(&lt;30%)</span>
+                </button>
               </div>
             )}
 
